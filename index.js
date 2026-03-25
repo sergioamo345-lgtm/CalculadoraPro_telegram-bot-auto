@@ -1,4 +1,4 @@
-// index.js atualizado
+// index.js atualizado completo
 const TelegramBot = require('node-telegram-bot-api');
 const mercadopago = require('mercadopago');
 const express = require('express');
@@ -36,7 +36,7 @@ bot.setWebHook(`${WEBHOOK_URL}/bot${TELEGRAM_TOKEN}`);
 
 // ===== MERCADO PAGO =====
 mercadopago.configure({ access_token: MP_TOKEN });
-console.log("✅ Mercado Pago:", MP_TOKEN ? "OK" : "ERRO");
+console.log("✅ Mercado Pago configurado");
 
 // ===== MENU DO BOT =====
 bot.setMyCommands([
@@ -46,7 +46,7 @@ bot.setMyCommands([
     { command: '/ajuda', description: 'Instruções e suporte rápido' }
 ]);
 
-// ===== FUNÇÃO PIX =====
+// ===== FUNÇÃO PARA CRIAR PAGAMENTO =====
 async function criarPagamento(chatId) {
     try {
         const payment_data = {
@@ -75,7 +75,7 @@ async function criarPagamento(chatId) {
 
         return pagamento.body;
     } catch (error) {
-        console.error("❌ ERRO PIX:", error);
+        console.error("❌ ERRO ao criar pagamento:", error);
         return null;
     }
 }
