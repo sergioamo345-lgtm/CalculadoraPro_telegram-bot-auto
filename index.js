@@ -1,8 +1,10 @@
+// index.js atualizado
 const TelegramBot = require('node-telegram-bot-api');
 const mercadopago = require('mercadopago');
 const express = require('express');
 const bodyParser = require('body-parser');
 const { createClient } = require('@supabase/supabase-js');
+const QRCode = require('qrcode');
 
 // ===== CONFIG =====
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -24,21 +26,25 @@ const app = express();
 app.use(bodyParser.json());
 
 // ===== BOT =====
-// 🚨 IMPORTANTE: sem polling!
+// 🚨 Sem polling, usando webhook
 const bot = new TelegramBot(TELEGRAM_TOKEN);
-
-// Rota do webhook do Telegram
 app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
     bot.processUpdate(req.body);
     res.sendStatus(200);
 });
-
-// Define o webhook no Telegram
 bot.setWebHook(`${WEBHOOK_URL}/bot${TELEGRAM_TOKEN}`);
 
 // ===== MERCADO PAGO =====
 mercadopago.configure({ access_token: MP_TOKEN });
 console.log("✅ Mercado Pago:", MP_TOKEN ? "OK" : "ERRO");
+
+// ===== MENU DO BOT =====
+bot.setMyCommands([
+    { command: '/start', description: 'Começar e entender teste grátis' },
+    { command: '/comprar', description: 'Comprar assinatura 30 dias R$10' },
+    { command: '/assinatura', description: 'Verificar status da assinatura' },
+    { command: '/ajuda', description: 'Instruções e suporte rápido' }
+]);
 
 // ===== FUNÇÃO PIX =====
 async function criarPagamento(chatId) {
@@ -74,20 +80,70 @@ async function criarPagamento(chatId) {
     }
 }
 
-// ===== ROTAS DO BOT =====
+// ===== COMANDOS DO BOT =====
+
+// /start
 bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, "🚀 Bem-vindo!\nUse /comprar para liberar acesso 🔓");
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, 
+        `👋 Olá *${msg.from.first_name}*!\n\n` +
+        `Você tem *7 dias grátis* para testar o app.\n` +
+        `Após o teste, será necessário assinar 30 dias por R$10 para continuar usando.\n\n` +
+        `Use o menu abaixo para comprar, verificar assinatura ou pedir ajuda.`,
+        { parse_mode: 'Markdown' }
+    );
 });
 
+// /ajuda
+bot.onText(/\/ajuda/, (msg) => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, 
+        '💡 Comandos disponíveis:\n' +
+        '/start - Começar e entender teste grátis\n' +
+        '/comprar - Comprar assinatura 30 dias R$10\n' +
+        '/assinatura - Ver status da assinatura\n' +
+        '/ajuda - Suporte rápido',
+        { parse_mode: 'Markdown' }
+    );
+});
+
+// /comprar
 bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
-    bot.sendMessage(chatId, "⏳ Gerando PIX...");
+    bot.sendMessage(chatId, "⏳ Gerando pagamento...");
 
     const pagamento = await criarPagamento(chatId);
     if (!pagamento) return bot.sendMessage(chatId, "❌ Erro ao gerar pagamento.");
 
-    const pix = pagamento.point_of_interaction.transaction_data.qr_code;
-    bot.sendMessage(chatId, `💰 PAGAMENTO VIA PIX\n\n💵 Valor: R$10,00\n\n📲 Copie e cole:\n\n${pix}`);
+    const linkPagamento = pagamento.point_of_interaction.transaction_data.ticket_url;
+
+    // Envia link fácil de copiar
+    bot.sendMessage(chatId, `💳 Para assinar 30 dias, clique ou copie o link abaixo:\n\`\`\`\n${linkPagamento}\n\`\`\``, { parse_mode: 'Markdown' });
+
+    // Gera QR Code do link
+    QRCode.toDataURL(linkPagamento, (err, url) => {
+        if (err) return bot.sendMessage(chatId, '❌ Erro ao gerar QR Code. Use o link acima para pagar.');
+        bot.sendPhoto(chatId, url, { caption: '📲 Escaneie o QR Code para pagar' });
+    });
+});
+
+// /assinatura
+bot.onText(/\/assinatura/, async (msg) => {
+    const chatId = msg.chat.id;
+    const { data, error } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
+
+    if (error || !data) {
+        return bot.sendMessage(chatId, `❌ Nenhuma assinatura encontrada.\nUse /comprar para adquirir.`);
+    }
+
+    const hoje = new Date();
+    const expiracao = new Date(data.expires_at);
+    if (data.status === 'ativo' && expiracao > hoje) {
+        const diasRestantes = Math.ceil((expiracao - hoje) / (1000*60*60*24));
+        bot.sendMessage(chatId, `✅ Sua assinatura está ativa!\nFaltam *${diasRestantes} dias* para expirar.`, { parse_mode: 'Markdown' });
+    } else {
+        bot.sendMessage(chatId, `❌ Sua assinatura expirou ou ainda não foi paga.\nUse /comprar para renovar.`, { parse_mode: 'Markdown' });
+    }
 });
 
 // ===== WEBHOOK MERCADO PAGO =====
@@ -98,7 +154,6 @@ app.post('/webhook', async (req, res) => {
         if (req.body.type === "payment") {
             const paymentId = req.body.data.id;
             const pagamento = await mercadopago.payment.findById(paymentId);
-
             const status = pagamento.body.status;
             const chat_id = pagamento.body.metadata?.chat_id;
 
@@ -126,7 +181,7 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
-// ===== START =====
+// ===== START SERVIDOR =====
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Servidor rodando na porta ${PORT}`);
