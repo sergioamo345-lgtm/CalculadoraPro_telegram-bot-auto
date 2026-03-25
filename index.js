@@ -1,74 +1,69 @@
 const TelegramBot = require('node-telegram-bot-api');
-const { createClient } = require('@supabase/supabase-js');
+const mercadopago = require('mercadopago');
 
-// VARIÁVEIS
-const token = process.env.TELEGRAM_TOKEN;
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
+// ===== CONFIG =====
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 
-if (!token || !supabaseUrl || !supabaseKey) {
-  throw new Error("❌ Variáveis não configuradas");
-}
+// Inicia bot
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// INICIAR
-const bot = new TelegramBot(token, { polling: true });
-const supabase = createClient(supabaseUrl, supabaseKey);
+// Configura Mercado Pago
+mercadopago.configure({
+    access_token: process.env.MERCADO_PAGO_TOKEN
+});
 
-// CRIAR USUÁRIO (7 dias grátis)
-async function criarUsuario(id) {
-  const dataExpiracao = new Date();
-  dataExpiracao.setDate(dataExpiracao.getDate() + 7);
+// ===== FUNÇÃO PIX =====
+async function criarPagamento(email) {
+    const payment_data = {
+        transaction_amount: 10.00,
+        description: "Acesso Calculadora Pro",
+        payment_method_id: "pix",
+        payer: {
+            email: email || "cliente@email.com"
+        }
+    };
 
-  await supabase.from('usuarios').insert([
-    {
-      id: id,
-      status: 'trial',
-      data_expiracao: dataExpiracao
+    try {
+        const pagamento = await mercadopago.payment.create(payment_data);
+        return pagamento.body;
+    } catch (error) {
+        console.error("Erro ao criar pagamento:", error);
+        return null;
     }
-  ]);
 }
 
-// VERIFICAR ACESSO
-async function verificarAcesso(id) {
-  const { data } = await supabase
-    .from('usuarios')
-    .select('*')
-    .eq('id', id)
-    .single();
+// ===== COMANDOS =====
 
-  if (!data) return false;
-
-  const agora = new Date();
-  const expiracao = new Date(data.data_expiracao);
-
-  return agora <= expiracao;
-}
-
-// COMANDO /start (NOVO SISTEMA)
-bot.onText(/\/start/, async (msg) => {
-  const chatId = msg.chat.id;
-
-  const { data } = await supabase
-    .from('usuarios')
-    .select('*')
-    .eq('id', chatId)
-    .single();
-
-  if (!data) {
-    await criarUsuario(chatId);
-    return bot.sendMessage(chatId, "🎁 Você ganhou 7 dias grátis!");
-  }
-
-  const acesso = await verificarAcesso(chatId);
-
-  if (!acesso) {
-    return bot.sendMessage(chatId, "🔒 Seu acesso expirou. Use /comprar");
-  }
-
-  bot.sendMessage(chatId, "✅ Acesso liberado!");
+// Start
+bot.onText(/\/start/, (msg) => {
+    bot.sendMessage(msg.chat.id,
+        `🚀 Bem-vindo à Calculadora Pro!\n\n` +
+        `Use /comprar para liberar acesso 🔓`
+    );
 });
 
-// ERROS
-bot.on("polling_error", (error) => {
-  console.log(error);
+// Comprar (gera PIX)
+bot.onText(/\/comprar/, async (msg) => {
+    const chatId = msg.chat.id;
+
+    bot.sendMessage(chatId, "⏳ Gerando pagamento PIX...");
+
+    const pagamento = await criarPagamento();
+
+    if (!pagamento) {
+        return bot.sendMessage(chatId, "❌ Erro ao gerar pagamento.");
+    }
+
+    const pixCopiaCola = pagamento.point_of_interaction.transaction_data.qr_code;
+
+    bot.sendMessage(chatId,
+        `💰 PAGAMENTO VIA PIX\n\n` +
+        `💵 Valor: R$10,00\n\n` +
+        `📲 Copie e cole no seu banco:\n\n` +
+        `${pixCopiaCola}\n\n` +
+        `⏱ Após o pagamento, a liberação será automática (em breve)`
+    );
 });
+
+// ===== LOG =====
+console.log("🤖 Bot rodando...");
