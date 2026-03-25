@@ -44,12 +44,18 @@ async function criarPagamento(chatId) {
         const pagamento = await mercadopago.payment.create(payment_data);
         const paymentId = pagamento.body.id;
 
-        await supabase.from('pagamentos').insert([{
+        const { data, error } = await supabase.from('pagamentos').insert([{
             id: paymentId,
             chat_id: chatId,
             status: "pending",
             valor: 10
         }]);
+
+        if (error) {
+            console.error("❌ ERRO SUPABASE (insert pagamentos):", error);
+        } else {
+            console.log("✅ Pagamento salvo:", data);
+        }
 
         return pagamento.body;
     } catch (error) {
@@ -86,18 +92,33 @@ app.post('/webhook', async (req, res) => {
             const status = pagamento.body.status;
             const chat_id = pagamento.body.metadata?.chat_id;
 
-            await supabase.from('pagamentos').update({ status }).eq('id', paymentId);
+            const { error: errUpdate } = await supabase
+                .from('pagamentos')
+                .update({ status })
+                .eq('id', paymentId);
+
+            if (errUpdate) {
+                console.error("❌ ERRO SUPABASE (update pagamentos):", errUpdate);
+            } else {
+                console.log("✅ Pagamento atualizado:", paymentId, status);
+            }
 
             if (status === "approved" && chat_id) {
                 const novaData = new Date();
                 novaData.setDate(novaData.getDate() + 30);
 
-                await supabase.from('usuarios').upsert({
+                const { error: errUser } = await supabase.from('usuarios').upsert({
                     chat_id,
                     status: "ativo",
                     plano: "mensal",
                     expires_at: novaData
                 });
+
+                if (errUser) {
+                    console.error("❌ ERRO SUPABASE (upsert usuarios):", errUser);
+                } else {
+                    console.log("✅ Usuário liberado:", chat_id);
+                }
 
                 bot.sendMessage(chat_id, "✅ Pagamento aprovado! Acesso liberado 🚀");
             }
@@ -115,7 +136,11 @@ const ADMIN_KEY = "123456";
 
 app.get('/usuarios', async (req, res) => {
     if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
-    const { data } = await supabase.from('usuarios').select('*');
+    const { data, error } = await supabase.from('usuarios').select('*');
+    if (error) {
+        console.error("❌ ERRO SUPABASE (select usuarios):", error);
+        return res.sendStatus(500);
+    }
     res.json(data);
 });
 
@@ -126,12 +151,17 @@ app.post('/liberar', async (req, res) => {
     const novaData = new Date();
     novaData.setDate(novaData.getDate() + 30);
 
-    await supabase.from('usuarios').upsert({
+    const { error } = await supabase.from('usuarios').upsert({
         chat_id,
         status: "ativo",
         plano: "manual",
         expires_at: novaData
     });
+
+    if (error) {
+        console.error("❌ ERRO SUPABASE (liberar usuario):", error);
+        return res.sendStatus(500);
+    }
 
     res.send("ok");
 });
@@ -140,13 +170,24 @@ app.post('/bloquear', async (req, res) => {
     if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
     const { chat_id } = req.body;
 
-    await supabase.from('usuarios').update({ status: "bloqueado" }).eq('chat_id', chat_id);
+    const { error } = await supabase.from('usuarios').update({ status: "bloqueado" }).eq('chat_id', chat_id);
+
+    if (error) {
+        console.error("❌ ERRO SUPABASE (bloquear usuario):", error);
+        return res.sendStatus(500);
+    }
+
     res.send("ok");
 });
 
 app.get('/faturamento', async (req, res) => {
     if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
-    const { data } = await supabase.from('pagamentos').select('*').eq('status', 'approved');
+    const { data, error } = await supabase.from('pagamentos').select('*').eq('status', 'approved');
+
+    if (error) {
+        console.error("❌ ERRO SUPABASE (faturamento):", error);
+        return res.sendStatus(500);
+    }
 
     let total = 0;
     data.forEach(p => total += Number(p.valor));
