@@ -1,6 +1,7 @@
 const TelegramBot = require('node-telegram-bot-api');
 const mercadopago = require('mercadopago');
 const express = require('express');
+const bodyParser = require('body-parser');
 const { createClient } = require('@supabase/supabase-js');
 
 // ===== CONFIG =====
@@ -11,7 +12,7 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
 // ===== VALIDAÇÃO =====
 if (!TELEGRAM_TOKEN || !MP_TOKEN || !SUPABASE_URL || !SUPABASE_KEY) {
-    console.log("❌ ERRO: Variáveis de ambiente não definidas");
+    console.error("❌ ERRO: Variáveis de ambiente não configuradas");
     process.exit(1);
 }
 
@@ -20,7 +21,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ===== EXPRESS =====
 const app = express();
-app.use(express.json());
+app.use(bodyParser.json());
 
 // ===== BOT =====
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
@@ -30,21 +31,21 @@ mercadopago.configure({
     access_token: MP_TOKEN
 });
 
-console.log("✅ Mercado Pago OK");
+console.log("✅ Mercado Pago:", MP_TOKEN ? "OK" : "ERRO");
 
 // ===== FUNÇÃO PIX =====
 async function criarPagamento(chatId) {
-    const payment_data = {
-        transaction_amount: 10.00,
-        description: "Acesso Calculadora Pro",
-        payment_method_id: "pix",
-        payer: { email: "cliente@email.com" },
-        metadata: {
-            chat_id: chatId.toString()
-        }
-    };
-
     try {
+        const payment_data = {
+            transaction_amount: 10.00,
+            description: "Acesso Calculadora Pro",
+            payment_method_id: "pix",
+            payer: { email: "cliente@email.com" },
+            metadata: {
+                chat_id: chatId.toString()
+            }
+        };
+
         const pagamento = await mercadopago.payment.create(payment_data);
 
         const paymentId = pagamento.body.id;
@@ -60,19 +61,21 @@ async function criarPagamento(chatId) {
         return pagamento.body;
 
     } catch (error) {
-        console.error("❌ ERRO AO CRIAR PAGAMENTO:", error);
+        console.error("❌ ERRO PIX:", error);
         return null;
     }
 }
 
 // ===== BOT =====
 
+// Start
 bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id,
-        `🚀 Bem-vindo!\nUse /comprar para liberar acesso 🔓`
+        `🚀 Bem-vindo!\n\nUse /comprar para liberar acesso 🔓`
     );
 });
 
+// Comprar
 bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
 
@@ -89,7 +92,7 @@ bot.onText(/\/comprar/, async (msg) => {
     bot.sendMessage(chatId,
         `💰 PAGAMENTO VIA PIX\n\n` +
         `💵 Valor: R$10,00\n\n` +
-        `📲 Copie e cole no seu banco:\n\n${pix}`
+        `📲 Copie e cole:\n\n${pix}`
     );
 });
 
@@ -105,22 +108,34 @@ app.post('/webhook', async (req, res) => {
 
             const status = pagamento.body.status;
             const valor = pagamento.body.transaction_amount;
-            const chat_id = pagamento.body.metadata?.chat_id;
 
             console.log("STATUS:", status);
 
-            if (status === "approved" && chat_id) {
+            // 🔥 ATUALIZA PAGAMENTO
+            await supabase
+                .from('pagamentos')
+                .update({ status: status })
+                .eq('id', paymentId);
 
-                // Atualiza pagamento
-                await supabase
+            if (status === "approved") {
+
+                const { data: pagamentoDB } = await supabase
                     .from('pagamentos')
-                    .update({ status: "approved" })
-                    .eq('id', paymentId);
+                    .select('*')
+                    .eq('id', paymentId)
+                    .single();
 
-                // Libera usuário
+                if (!pagamentoDB) {
+                    console.log("❌ pagamento não encontrado");
+                    return res.sendStatus(200);
+                }
+
+                const chat_id = pagamentoDB.chat_id;
+
                 const novaData = new Date();
                 novaData.setDate(novaData.getDate() + 30);
 
+                // 🔓 LIBERA USUÁRIO
                 await supabase.from('usuarios').upsert({
                     chat_id,
                     status: "ativo",
@@ -128,12 +143,10 @@ app.post('/webhook', async (req, res) => {
                     expires_at: novaData
                 });
 
-                // Mensagem no Telegram
+                // 🤖 AVISA NO TELEGRAM
                 bot.sendMessage(chat_id,
                     "✅ Pagamento aprovado! Acesso liberado 🚀"
                 );
-
-                console.log("✅ USUÁRIO LIBERADO:", chat_id);
             }
         }
 
@@ -148,17 +161,15 @@ app.post('/webhook', async (req, res) => {
 // ===== ADMIN =====
 const ADMIN_KEY = "123456";
 
-// 📊 LISTAR USUÁRIOS
+// listar usuários
 app.get('/usuarios', async (req, res) => {
     if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
 
-    const { data, error } = await supabase.from('usuarios').select('*');
-    if (error) return res.status(500).send(error);
-
+    const { data } = await supabase.from('usuarios').select('*');
     res.json(data);
 });
 
-// 🔓 LIBERAR
+// liberar manual
 app.post('/liberar', async (req, res) => {
     if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
 
@@ -177,7 +188,7 @@ app.post('/liberar', async (req, res) => {
     res.send("ok");
 });
 
-// 🚫 BLOQUEAR
+// bloquear
 app.post('/bloquear', async (req, res) => {
     if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
 
@@ -191,19 +202,17 @@ app.post('/bloquear', async (req, res) => {
     res.send("ok");
 });
 
-// 💰 FATURAMENTO
+// faturamento
 app.get('/faturamento', async (req, res) => {
     if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
 
-    const { data, error } = await supabase
+    const { data } = await supabase
         .from('pagamentos')
         .select('*')
         .eq('status', 'approved');
 
-    if (error) return res.status(500).send(error);
-
     let total = 0;
-    data.forEach(p => total += Number(p.valor || 0));
+    data.forEach(p => total += Number(p.valor));
 
     res.json({
         total,
@@ -215,5 +224,5 @@ app.get('/faturamento', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log("🚀 Servidor rodando na porta", PORT);
+    console.log(`🚀 Servidor rodando na porta ${PORT}`);
 });
