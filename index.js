@@ -9,8 +9,11 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 // Configura Mercado Pago
 mercadopago.configure({
-    access_token: process.env.MERCADO_PAGO_TOKEN
+    access_token: process.env.MP_ACCESS_TOKEN
 });
+
+// Log para verificar se o token foi carregado
+console.log("Token Mercado Pago:", process.env.MP_ACCESS_TOKEN ? "OK" : "NÃO ENCONTRADO");
 
 // ===== FUNÇÃO PIX =====
 async function criarPagamento(email) {
