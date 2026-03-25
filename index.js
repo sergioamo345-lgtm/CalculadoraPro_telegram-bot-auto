@@ -9,9 +9,9 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
-// ===== VALIDAÇÃO =====
-if (!TELEGRAM_TOKEN || !MP_TOKEN || !SUPABASE_URL || !SUPABASE_KEY) {
+if (!TELEGRAM_TOKEN || !MP_TOKEN || !SUPABASE_URL || !SUPABASE_KEY || !WEBHOOK_URL) {
     console.error("❌ ERRO: Variáveis de ambiente não configuradas");
     process.exit(1);
 }
@@ -24,7 +24,16 @@ const app = express();
 app.use(bodyParser.json());
 
 // ===== BOT =====
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const bot = new TelegramBot(TELEGRAM_TOKEN);
+
+// Rota do webhook do Telegram
+app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
+    bot.processUpdate(req.body);
+    res.sendStatus(200);
+});
+
+// Define o webhook no Telegram
+bot.setWebHook(`${WEBHOOK_URL}/bot${TELEGRAM_TOKEN}`);
 
 // ===== MERCADO PAGO =====
 mercadopago.configure({ access_token: MP_TOKEN });
@@ -44,7 +53,7 @@ async function criarPagamento(chatId) {
         const pagamento = await mercadopago.payment.create(payment_data);
         const paymentId = pagamento.body.id;
 
-        const { data, error } = await supabase.from('pagamentos').insert([{
+        const { error } = await supabase.from('pagamentos').insert([{
             id: paymentId,
             chat_id: chatId,
             status: "pending",
@@ -54,7 +63,7 @@ async function criarPagamento(chatId) {
         if (error) {
             console.error("❌ ERRO SUPABASE (insert pagamentos):", error);
         } else {
-            console.log("✅ Pagamento salvo:", data);
+            console.log("✅ Pagamento salvo:", paymentId);
         }
 
         return pagamento.body;
@@ -80,7 +89,7 @@ bot.onText(/\/comprar/, async (msg) => {
     bot.sendMessage(chatId, `💰 PAGAMENTO VIA PIX\n\n💵 Valor: R$10,00\n\n📲 Copie e cole:\n\n${pix}`);
 });
 
-// ===== WEBHOOK =====
+// ===== WEBHOOK MERCADO PAGO =====
 app.post('/webhook', async (req, res) => {
     try {
         console.log("🔥 WEBHOOK recebido:", req.body);
@@ -92,33 +101,18 @@ app.post('/webhook', async (req, res) => {
             const status = pagamento.body.status;
             const chat_id = pagamento.body.metadata?.chat_id;
 
-            const { error: errUpdate } = await supabase
-                .from('pagamentos')
-                .update({ status })
-                .eq('id', paymentId);
-
-            if (errUpdate) {
-                console.error("❌ ERRO SUPABASE (update pagamentos):", errUpdate);
-            } else {
-                console.log("✅ Pagamento atualizado:", paymentId, status);
-            }
+            await supabase.from('pagamentos').update({ status }).eq('id', paymentId);
 
             if (status === "approved" && chat_id) {
                 const novaData = new Date();
                 novaData.setDate(novaData.getDate() + 30);
 
-                const { error: errUser } = await supabase.from('usuarios').upsert({
+                await supabase.from('usuarios').upsert({
                     chat_id,
                     status: "ativo",
                     plano: "mensal",
                     expires_at: novaData
                 });
-
-                if (errUser) {
-                    console.error("❌ ERRO SUPABASE (upsert usuarios):", errUser);
-                } else {
-                    console.log("✅ Usuário liberado:", chat_id);
-                }
 
                 bot.sendMessage(chat_id, "✅ Pagamento aprovado! Acesso liberado 🚀");
             }
@@ -129,70 +123,6 @@ app.post('/webhook', async (req, res) => {
         console.error("❌ ERRO WEBHOOK:", err);
         res.sendStatus(500);
     }
-});
-
-// ===== ADMIN =====
-const ADMIN_KEY = "123456";
-
-app.get('/usuarios', async (req, res) => {
-    if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
-    const { data, error } = await supabase.from('usuarios').select('*');
-    if (error) {
-        console.error("❌ ERRO SUPABASE (select usuarios):", error);
-        return res.sendStatus(500);
-    }
-    res.json(data);
-});
-
-app.post('/liberar', async (req, res) => {
-    if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
-    const { chat_id } = req.body;
-
-    const novaData = new Date();
-    novaData.setDate(novaData.getDate() + 30);
-
-    const { error } = await supabase.from('usuarios').upsert({
-        chat_id,
-        status: "ativo",
-        plano: "manual",
-        expires_at: novaData
-    });
-
-    if (error) {
-        console.error("❌ ERRO SUPABASE (liberar usuario):", error);
-        return res.sendStatus(500);
-    }
-
-    res.send("ok");
-});
-
-app.post('/bloquear', async (req, res) => {
-    if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
-    const { chat_id } = req.body;
-
-    const { error } = await supabase.from('usuarios').update({ status: "bloqueado" }).eq('chat_id', chat_id);
-
-    if (error) {
-        console.error("❌ ERRO SUPABASE (bloquear usuario):", error);
-        return res.sendStatus(500);
-    }
-
-    res.send("ok");
-});
-
-app.get('/faturamento', async (req, res) => {
-    if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
-    const { data, error } = await supabase.from('pagamentos').select('*').eq('status', 'approved');
-
-    if (error) {
-        console.error("❌ ERRO SUPABASE (faturamento):", error);
-        return res.sendStatus(500);
-    }
-
-    let total = 0;
-    data.forEach(p => total += Number(p.valor));
-
-    res.json({ total, quantidade: data.length });
 });
 
 // ===== START =====
