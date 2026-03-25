@@ -1,12 +1,16 @@
 {
-  "name": "telegram-bot",
+  "name": "calculadora-pro-bot",
   "version": "1.0.0",
+  "description": "Bot Telegram com pagamento PIX via Mercado Pago",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "node-telegram-bot-api": "^0.66.0",
-    "@supabase/supabase-js": "^2.39.0"
+    "node-telegram-bot-api": "^0.61.0",
+    "mercadopago": "^1.5.13"
   }
 }
