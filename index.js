@@ -40,7 +40,7 @@ async function criarPagamento(chatId) {
             transaction_amount: 10.00,
             description: "Acesso Calculadora Pro",
             payment_method_id: "pix",
-            payer: { email: "cliente@email.com" },
+            payer: { email: `user${chatId}@example.com` }, // 🔹 email único
             metadata: {
                 chat_id: chatId.toString()
             }
@@ -101,7 +101,12 @@ app.post('/webhook', async (req, res) => {
     try {
         console.log("🔥 WEBHOOK:", req.body);
 
-        if (req.body.type === "payment") {
+        // 🔹 Ajuste: aceita type, topic ou action
+        if (
+            req.body.type === "payment" ||
+            req.body.topic === "payment" ||
+            (req.body.action && req.body.action.includes("payment"))
+        ) {
             const paymentId = req.body.data.id;
 
             const pagamento = await mercadopago.payment.findById(paymentId);
@@ -118,7 +123,6 @@ app.post('/webhook', async (req, res) => {
                 .eq('id', paymentId);
 
             if (status === "approved") {
-
                 const { data: pagamentoDB } = await supabase
                     .from('pagamentos')
                     .select('*')
