@@ -24,6 +24,7 @@ const app = express();
 app.use(bodyParser.json());
 
 // ===== BOT =====
+// 🚨 IMPORTANTE: sem polling!
 const bot = new TelegramBot(TELEGRAM_TOKEN);
 
 // Rota do webhook do Telegram
