@@ -13,6 +13,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const BASE_URL = process.env.BASE_URL; // ex: https://seuapp.onrender.com
 const ADMIN_KEY = process.env.ADMIN_KEY || '123456';
+const MP_MODE = process.env.MP_MODE || 'sandbox'; // 'sandbox' ou 'live'
 
 if (!TELEGRAM_TOKEN || !MP_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !BASE_URL) {
     console.error("❌ ERRO: Variáveis de ambiente não configuradas");
@@ -23,7 +24,7 @@ if (!TELEGRAM_TOKEN || !MP_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ===== MERCADO PAGO =====
-const mp = new mercadopago({ access_token: MP_TOKEN });
+mercadopago.configure({ access_token: MP_TOKEN }); // Corrige a instância para node-mercadopago v2
 
 // ===== EXPRESS =====
 const app = express();
@@ -31,11 +32,17 @@ app.use(cors());
 app.use(express.json());
 
 // ===== TELEGRAM WEBHOOK =====
-const bot = new TelegramBot(TELEGRAM_TOKEN);
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 bot.setWebHook(`${BASE_URL}/telegram-webhook`);
+
 app.post(`/telegram-webhook`, async (req, res) => {
-    bot.processUpdate(req.body);
-    res.sendStatus(200);
+    try {
+        await bot.processUpdate(req.body);
+        res.sendStatus(200);
+    } catch (err) {
+        console.error("❌ ERRO TELEGRAM WEBHOOK:", err);
+        res.sendStatus(500);
+    }
 });
 
 // ===== BOT COMANDOS =====
@@ -63,20 +70,14 @@ async function criarPagamento(chatId) {
             transaction_amount: 10,
             description: "Acesso Calculadora Pro",
             payment_method_id: "pix",
-            payer: { email: `user${chatId}@example.com` },
-            metadata: { chat_id: chatId.toString() },
-            // Adicionado items.id conforme recomendação do MP
-            items: [
-                {
-                    id: `pro30dias-${chatId}`,
-                    title: "Assinatura Calculadora Pro 30 dias",
-                    quantity: 1,
-                    unit_price: 10
-                }
-            ]
+            payer: { email: `user${chatId}@example.com` }, // use email válido em live
+            metadata: { chat_id: chatId.toString(), mode: MP_MODE },
+            additional_info: {
+                items: [{ id: `assinatura_${chatId}`, title: 'Assinatura 30 dias', quantity: 1, unit_price: 10 }]
+            }
         };
 
-        const result = await mp.payment.create(paymentData);
+        const result = await mercadopago.payment.create(paymentData);
         const paymentId = result.response?.id;
 
         if (!paymentId) throw new Error("Pagamento não retornou ID válido");
@@ -85,7 +86,8 @@ async function criarPagamento(chatId) {
             payment_id: paymentId,
             chat_id: chatId,
             status: "pending",
-            valor: 10
+            valor: 10,
+            mode: MP_MODE
         }]);
 
         if (error) console.error("❌ ERRO SUPABASE:", error);
@@ -138,27 +140,31 @@ bot.onText(/\/assinatura/, async (msg) => {
 // ===== WEBHOOK PIX =====
 app.post('/webhook', async (req, res) => {
     try {
-        console.log("🔥 WEBHOOK:", req.body);
+        console.log("🔥 WEBHOOK RECEBIDO:", req.body);
 
-        if (req.body.type === "payment") {
-            const paymentId = req.body.data.id;
-            const pagamento = await mp.payment.get({ id: paymentId });
-            const status = pagamento.response?.status;
-            const chat_id = pagamento.response?.metadata?.chat_id;
+        const action = req.body.action;
+        const paymentId = req.body.data.id;
 
-            await supabase.from('pagamentos').update({ status }).eq('payment_id', paymentId);
+        if (!paymentId) return res.sendStatus(400);
 
-            if (status === "approved" && chat_id) {
-                const novaData = new Date();
-                novaData.setDate(novaData.getDate() + 30);
-                await supabase.from('usuarios').upsert({
-                    chat_id,
-                    status: "ativo",
-                    plano: "mensal",
-                    expires_at: novaData
-                });
-                bot.sendMessage(chat_id, "✅ Pagamento aprovado! Acesso liberado 🚀");
-            }
+        const pagamento = await mercadopago.payment.get({ id: paymentId });
+        const status = pagamento.response?.status;
+        const chat_id = pagamento.response?.metadata?.chat_id;
+
+        console.log(`💰 Payment ID: ${paymentId}, Status: ${status}, Chat: ${chat_id}`);
+
+        await supabase.from('pagamentos').update({ status }).eq('payment_id', paymentId);
+
+        if (status === "approved" && chat_id) {
+            const novaData = new Date();
+            novaData.setDate(novaData.getDate() + 30);
+            await supabase.from('usuarios').upsert({
+                chat_id,
+                status: "ativo",
+                plano: "mensal",
+                expires_at: novaData
+            });
+            bot.sendMessage(chat_id, "✅ Pagamento aprovado! Acesso liberado 🚀");
         }
 
         res.sendStatus(200);
