@@ -68,15 +68,31 @@ async function criarPagamento(chatId) {
     try {
         const paymentData = {
             transaction_amount: 10,
-            description: "Acesso Calculadora Pro",
-            payment_method_id: "pix",
-            payer: { email: `user${chatId}@example.com` },
-            metadata: { chat_id: chatId.toString(), mode: MP_MODE },
-            additional_info: {
-                items: [{ id: `assinatura_${chatId}`, title: 'Assinatura 30 dias', quantity: 1, unit_price: 10 }]
+            description: "Acesso Calculadora Moto Pro",
+            payment_method_id: "pix", // ou "visa" para cartão
+            payer: {
+                email: `user${chatId}@example.com`, // em produção, use email real
+                first_name: "Nome",
+                last_name: "Sobrenome"
+                // address, identification, phone → se tiver
             },
-            // Para cartão de crédito seria necessário:
-            // device: { id: "<DEVICE_ID>" }
+            metadata: { chat_id: chatId.toString(), mode: MP_MODE },
+            external_reference: `assinatura_${chatId}_${Date.now()}`, // 🔑 referência única
+            notification_url: `${BASE_URL}/webhook`, // 🔑 obrigatório
+            additional_info: {
+                items: [{
+                    id: `assinatura_${chatId}`,
+                    title: 'Assinatura 30 dias',
+                    description: 'Acesso completo à Calculadora Moto Pro',
+                    category_id: 'services',
+                    quantity: 1,
+                    unit_price: 10
+                }]
+            },
+            // Para cartão de crédito:
+            // device: { id: "<DEVICE_ID>" },
+            // issuer_id: "<ID do emissor>",
+            // statement_descriptor: "CALCULADORA MOTO PRO"
         };
 
         const result = await mercadopago.payment.create(paymentData);
@@ -89,7 +105,8 @@ async function criarPagamento(chatId) {
             chat_id: chatId,
             status: "pending",
             valor: 10,
-            mode: MP_MODE
+            mode: MP_MODE,
+            external_reference: paymentData.external_reference
         }]);
 
         if (error) console.error("❌ ERRO SUPABASE:", error);
