@@ -3,6 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { MercadoPagoConfig, Payment } = require('mercadopago');
 const { createClient } = require('@supabase/supabase-js');
 const QRCode = require('qrcode');
+const express = require('express');
 
 // ===== CONFIG =====
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -21,12 +22,16 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 // ===== BOT =====
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// ===== MERCADO PAGO (NOVO) =====
+// ===== MERCADO PAGO =====
 const client = new MercadoPagoConfig({
     accessToken: MP_TOKEN
 });
 
 console.log("✅ Mercado Pago configurado");
+
+// ===== EXPRESS =====
+const app = express();
+app.use(express.json());
 
 // ===== MENU =====
 bot.setMyCommands([
@@ -57,7 +62,7 @@ async function criarPagamento(chatId) {
 
         const paymentId = result.id;
 
-        // ⚠️ IMPORTANTE: não enviar id se sua tabela for auto
+        // salva no banco
         const { error } = await supabase.from('pagamentos').insert([{
             chat_id: chatId,
             status: "pending",
@@ -75,7 +80,7 @@ async function criarPagamento(chatId) {
     }
 }
 
-// ===== COMANDOS =====
+// ===== BOT =====
 
 // /start
 bot.onText(/\/start/, (msg) => {
@@ -103,13 +108,11 @@ bot.onText(/\/comprar/, async (msg) => {
 
     const pix = pagamento.point_of_interaction.transaction_data.qr_code;
 
-    // Código PIX
     bot.sendMessage(chatId,
         `💰 *PIX:*\n\`\`\`\n${pix}\n\`\`\``,
         { parse_mode: 'Markdown' }
     );
 
-    // QR Code
     QRCode.toDataURL(pix, (err, url) => {
         if (err) return;
         bot.sendPhoto(chatId, url, { caption: '📲 Escaneie para pagar' });
@@ -135,4 +138,58 @@ bot.onText(/\/assinatura/, async (msg) => {
     );
 
     bot.sendMessage(chatId, `✅ Ativo\nDias restantes: ${dias}`);
+});
+
+// ===== WEBHOOK =====
+app.post('/webhook', async (req, res) => {
+    try {
+        console.log("🔥 WEBHOOK:", req.body);
+
+        if (req.body.type === "payment") {
+            const paymentId = req.body.data.id;
+
+            const payment = new Payment(client);
+            const pagamento = await payment.get({ id: paymentId });
+
+            const status = pagamento.status;
+            const chat_id = pagamento.metadata?.chat_id;
+
+            console.log("💰 Status:", status);
+
+            // atualiza pagamento
+            await supabase
+                .from('pagamentos')
+                .update({ status })
+                .eq('chat_id', chat_id);
+
+            // libera acesso
+            if (status === "approved" && chat_id) {
+
+                const novaData = new Date();
+                novaData.setDate(novaData.getDate() + 30);
+
+                await supabase.from('usuarios').upsert({
+                    chat_id,
+                    status: "ativo",
+                    plano: "mensal",
+                    expires_at: novaData
+                });
+
+                console.log("✅ Usuário liberado:", chat_id);
+
+                bot.sendMessage(chat_id, "✅ Pagamento aprovado! Acesso liberado 🚀");
+            }
+        }
+
+        res.sendStatus(200);
+
+    } catch (err) {
+        console.log("❌ ERRO WEBHOOK:", err);
+        res.sendStatus(500);
+    }
+});
+
+// ===== START SERVIDOR =====
+app.listen(process.env.PORT || 3000, () => {
+    console.log("🚀 Servidor rodando");
 });
