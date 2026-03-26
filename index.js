@@ -37,8 +37,7 @@ app.use(express.json());
 bot.setMyCommands([
   { command: '/start', description: 'Começar a usar o bot' },
   { command: '/comprar', description: 'Comprar assinatura 30 dias R$10' },
-  { command: '/assinatura', description: 'Ver status da assinatura' },
-  { command: '/ajuda', description: 'Precisa de ajuda?' }
+  { command: '/assinatura', description: 'Ver status da assinatura' }
 ]);
 
 // ===== CRIAR PAGAMENTO =====
@@ -62,8 +61,9 @@ async function criarPagamento(chatId) {
 
         const paymentId = result.id;
 
-        // salva no banco
+        // SALVA COM PAYMENT_ID (IMPORTANTE)
         const { error } = await supabase.from('pagamentos').insert([{
+            payment_id: paymentId,
             chat_id: chatId,
             status: "pending",
             valor: 10
@@ -114,8 +114,9 @@ bot.onText(/\/comprar/, async (msg) => {
     );
 
     QRCode.toDataURL(pix, (err, url) => {
-        if (err) return;
-        bot.sendPhoto(chatId, url, { caption: '📲 Escaneie para pagar' });
+        if (!err) {
+            bot.sendPhoto(chatId, url, { caption: '📲 Escaneie para pagar' });
+        }
     });
 });
 
@@ -156,13 +157,12 @@ app.post('/webhook', async (req, res) => {
 
             console.log("💰 Status:", status);
 
-            // atualiza pagamento
+            // ATUALIZA PELO PAYMENT_ID (CORRETO)
             await supabase
                 .from('pagamentos')
                 .update({ status })
-                .eq('chat_id', chat_id);
+                .eq('payment_id', paymentId);
 
-            // libera acesso
             if (status === "approved" && chat_id) {
 
                 const novaData = new Date();
@@ -189,7 +189,30 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
-// ===== START SERVIDOR =====
+// ===== ADMIN =====
+const ADMIN_KEY = "123456";
+
+app.get('/admin/usuarios', async (req, res) => {
+    if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
+    const { data } = await supabase.from('usuarios').select('*');
+    res.json(data);
+});
+
+app.get('/admin/faturamento', async (req, res) => {
+    if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
+
+    const { data } = await supabase
+        .from('pagamentos')
+        .select('*')
+        .eq('status', 'approved');
+
+    let total = 0;
+    data.forEach(p => total += Number(p.valor));
+
+    res.json({ total, quantidade: data.length });
+});
+
+// ===== START =====
 app.listen(process.env.PORT || 3000, () => {
     console.log("🚀 Servidor rodando");
 });
