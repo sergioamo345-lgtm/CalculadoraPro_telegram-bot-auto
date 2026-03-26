@@ -4,6 +4,7 @@ const { MercadoPagoConfig, Payment } = require('mercadopago');
 const { createClient } = require('@supabase/supabase-js');
 const QRCode = require('qrcode');
 const express = require('express');
+const cors = require('cors');
 
 // ===== CONFIG =====
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -31,6 +32,7 @@ console.log("✅ Mercado Pago configurado");
 
 // ===== EXPRESS =====
 const app = express();
+app.use(cors()); // 🔥 LIBERA ACESSO DO PAINEL
 app.use(express.json());
 
 // ===== MENU =====
@@ -58,10 +60,8 @@ async function criarPagamento(chatId) {
         };
 
         const result = await payment.create({ body });
-
         const paymentId = result.id;
 
-        // SALVA COM PAYMENT_ID (IMPORTANTE)
         const { error } = await supabase.from('pagamentos').insert([{
             payment_id: paymentId,
             chat_id: chatId,
@@ -157,7 +157,6 @@ app.post('/webhook', async (req, res) => {
 
             console.log("💰 Status:", status);
 
-            // ATUALIZA PELO PAYMENT_ID (CORRETO)
             await supabase
                 .from('pagamentos')
                 .update({ status })
@@ -194,8 +193,12 @@ const ADMIN_KEY = "123456";
 
 app.get('/admin/usuarios', async (req, res) => {
     if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
-    const { data } = await supabase.from('usuarios').select('*');
-    res.json(data);
+
+    const { data, error } = await supabase.from('usuarios').select('*');
+
+    if (error) return res.status(500).json(error);
+
+    res.json(data || []);
 });
 
 app.get('/admin/faturamento', async (req, res) => {
