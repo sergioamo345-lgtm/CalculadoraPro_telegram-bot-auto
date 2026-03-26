@@ -1,6 +1,6 @@
 {
   "name": "calculadora-pro-bot",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Bot Telegram com pagamento PIX via Mercado Pago",
   "main": "index.js",
   "scripts": {
@@ -15,6 +15,7 @@
     "express": "^4.18.2",
     "body-parser": "^1.20.2",
     "@supabase/supabase-js": "^2.39.0",
-    "qrcode": "^1.5.1"
+    "qrcode": "^1.5.1",
+    "cors": "^2.8.5"
   }
 }
