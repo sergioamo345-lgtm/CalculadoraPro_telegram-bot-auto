@@ -24,7 +24,7 @@ if (!TELEGRAM_TOKEN || !MP_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ===== MERCADO PAGO =====
-mercadopago.configure({ access_token: MP_TOKEN }); // Corrige a instância para node-mercadopago v2
+mercadopago.configure({ access_token: MP_TOKEN });
 
 // ===== EXPRESS =====
 const app = express();
@@ -70,11 +70,13 @@ async function criarPagamento(chatId) {
             transaction_amount: 10,
             description: "Acesso Calculadora Pro",
             payment_method_id: "pix",
-            payer: { email: `user${chatId}@example.com` }, // use email válido em live
+            payer: { email: `user${chatId}@example.com` },
             metadata: { chat_id: chatId.toString(), mode: MP_MODE },
             additional_info: {
                 items: [{ id: `assinatura_${chatId}`, title: 'Assinatura 30 dias', quantity: 1, unit_price: 10 }]
-            }
+            },
+            // Para cartão de crédito seria necessário:
+            // device: { id: "<DEVICE_ID>" }
         };
 
         const result = await mercadopago.payment.create(paymentData);
@@ -133,6 +135,8 @@ bot.onText(/\/assinatura/, async (msg) => {
     if (!usuario || usuario.status !== "ativo") return bot.sendMessage(chatId, "❌ Sem assinatura ativa.");
 
     const expires = new Date(usuario.expires_at);
+    if (isNaN(expires)) return bot.sendMessage(chatId, "❌ Data de expiração inválida.");
+
     const dias = Math.ceil((expires - new Date()) / (1000 * 60 * 60 * 24));
     bot.sendMessage(chatId, `✅ Ativo\nDias restantes: ${dias}`);
 });
@@ -142,9 +146,7 @@ app.post('/webhook', async (req, res) => {
     try {
         console.log("🔥 WEBHOOK RECEBIDO:", req.body);
 
-        const action = req.body.action;
-        const paymentId = req.body.data.id;
-
+        const paymentId = req.body.data?.id;
         if (!paymentId) return res.sendStatus(400);
 
         const pagamento = await mercadopago.payment.get({ id: paymentId });
