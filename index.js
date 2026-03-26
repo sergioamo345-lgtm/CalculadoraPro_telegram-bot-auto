@@ -24,15 +24,12 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 // ===== MERCADO PAGO =====
-const client = new MercadoPagoConfig({
-    accessToken: MP_TOKEN
-});
-
+const client = new MercadoPagoConfig({ accessToken: MP_TOKEN });
 console.log("✅ Mercado Pago configurado");
 
 // ===== EXPRESS =====
 const app = express();
-app.use(cors()); // 🔥 LIBERA ACESSO DO PAINEL
+app.use(cors());
 app.use(express.json());
 
 // ===== MENU =====
@@ -60,7 +57,11 @@ async function criarPagamento(chatId) {
         };
 
         const result = await payment.create({ body });
-        const paymentId = result.id;
+        const paymentId = result.body?.id;
+
+        if (!paymentId) {
+            throw new Error("Pagamento não retornou ID válido");
+        }
 
         const { error } = await supabase.from('pagamentos').insert([{
             payment_id: paymentId,
@@ -72,7 +73,7 @@ async function criarPagamento(chatId) {
         if (error) console.error("❌ ERRO SUPABASE:", error);
         else console.log("✅ Pagamento salvo:", paymentId);
 
-        return result;
+        return result.body;
 
     } catch (error) {
         console.error("❌ ERRO PIX:", error);
@@ -106,7 +107,11 @@ bot.onText(/\/comprar/, async (msg) => {
         return bot.sendMessage(chatId, "❌ Erro ao gerar pagamento.");
     }
 
-    const pix = pagamento.point_of_interaction.transaction_data.qr_code;
+    const pix = pagamento.point_of_interaction?.transaction_data?.qr_code;
+
+    if (!pix) {
+        return bot.sendMessage(chatId, "❌ Erro: PIX não gerado.");
+    }
 
     bot.sendMessage(chatId,
         `💰 *PIX:*\n\`\`\`\n${pix}\n\`\`\``,
@@ -114,7 +119,9 @@ bot.onText(/\/comprar/, async (msg) => {
     );
 
     QRCode.toDataURL(pix, (err, url) => {
-        if (!err) {
+        if (err) {
+            console.error("❌ Erro ao gerar QRCode:", err);
+        } else {
             bot.sendPhoto(chatId, url, { caption: '📲 Escaneie para pagar' });
         }
     });
@@ -124,19 +131,27 @@ bot.onText(/\/comprar/, async (msg) => {
 bot.onText(/\/assinatura/, async (msg) => {
     const chatId = msg.chat.id;
 
-    const { data: usuario } = await supabase
+    const { data: usuario, error } = await supabase
         .from('usuarios')
         .select('*')
         .eq('chat_id', chatId)
         .single();
 
+    if (error) {
+        console.error("❌ ERRO SUPABASE:", error);
+        return bot.sendMessage(chatId, "❌ Erro ao verificar assinatura.");
+    }
+
     if (!usuario || usuario.status !== "ativo") {
         return bot.sendMessage(chatId, "❌ Sem assinatura ativa.");
     }
 
-    const dias = Math.ceil(
-        (new Date(usuario.expires_at) - new Date()) / (1000 * 60 * 60 * 24)
-    );
+    const expires = new Date(usuario.expires_at);
+    if (isNaN(expires)) {
+        return bot.sendMessage(chatId, "❌ Data de expiração inválida.");
+    }
+
+    const dias = Math.ceil((expires - new Date()) / (1000 * 60 * 60 * 24));
 
     bot.sendMessage(chatId, `✅ Ativo\nDias restantes: ${dias}`);
 });
@@ -152,8 +167,8 @@ app.post('/webhook', async (req, res) => {
             const payment = new Payment(client);
             const pagamento = await payment.get({ id: paymentId });
 
-            const status = pagamento.status;
-            const chat_id = pagamento.metadata?.chat_id;
+            const status = pagamento.body?.status;
+            const chat_id = pagamento.body?.metadata?.chat_id;
 
             console.log("💰 Status:", status);
 
@@ -163,7 +178,6 @@ app.post('/webhook', async (req, res) => {
                 .eq('payment_id', paymentId);
 
             if (status === "approved" && chat_id) {
-
                 const novaData = new Date();
                 novaData.setDate(novaData.getDate() + 30);
 
@@ -175,7 +189,6 @@ app.post('/webhook', async (req, res) => {
                 });
 
                 console.log("✅ Usuário liberado:", chat_id);
-
                 bot.sendMessage(chat_id, "✅ Pagamento aprovado! Acesso liberado 🚀");
             }
         }
@@ -189,7 +202,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ===== ADMIN =====
-const ADMIN_KEY = "123456";
+const ADMIN_KEY = process.env.ADMIN_KEY || "123456";
 
 app.get('/admin/usuarios', async (req, res) => {
     if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
@@ -204,10 +217,12 @@ app.get('/admin/usuarios', async (req, res) => {
 app.get('/admin/faturamento', async (req, res) => {
     if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
 
-    const { data } = await supabase
+    const { data, error } = await supabase
         .from('pagamentos')
         .select('*')
         .eq('status', 'approved');
+
+    if (error) return res.status(500).json(error);
 
     let total = 0;
     data.forEach(p => total += Number(p.valor));
