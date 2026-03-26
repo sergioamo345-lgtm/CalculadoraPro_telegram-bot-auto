@@ -64,7 +64,16 @@ async function criarPagamento(chatId) {
             description: "Acesso Calculadora Pro",
             payment_method_id: "pix",
             payer: { email: `user${chatId}@example.com` },
-            metadata: { chat_id: chatId.toString() }
+            metadata: { chat_id: chatId.toString() },
+            // Adicionado items.id conforme recomendação do MP
+            items: [
+                {
+                    id: `pro30dias-${chatId}`,
+                    title: "Assinatura Calculadora Pro 30 dias",
+                    quantity: 1,
+                    unit_price: 10
+                }
+            ]
         };
 
         const result = await mp.payment.create(paymentData);
