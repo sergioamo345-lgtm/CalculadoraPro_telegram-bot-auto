@@ -78,10 +78,13 @@ bot.onText(/\/comprar/, async (msg) => {
       }
     });
 
-    const pixCode = payment.point_of_interaction.transaction_data.qr_code;
+    // Extraindo chave PIX corretamente
+    const pixCode = payment.body.point_of_interaction.transaction_data.qr_code;
+    const pixLink = payment.body.point_of_interaction.transaction_data.ticket_url;
+
     await supabase.from('pix_attempts').insert([{ user_id: chatId, created_at: new Date() }]);
 
-    bot.sendMessage(chatId, '💳 Seu PIX foi gerado:', {
+    bot.sendMessage(chatId, `💳 Seu PIX foi gerado!\n\n🔑 Chave:\n${pixCode}\n\nOu pague pelo link:\n${pixLink}`, {
       reply_markup: {
         inline_keyboard: [[{ text: '📋 Copiar PIX', callback_data: `COPY_PIX_${pixCode}` }]]
       }
