@@ -260,4 +260,6 @@ app.get('/admin/faturamento', async (req, res) => {
     const { data, error } = await supabase.from('pagamentos').select('*').eq('status', 'approved');
     if (error) return res.status(500).json(error);
 
-    let total =
+    let total = 0;
+    data.forEach(p => total += Number(p.valor));
+    res
