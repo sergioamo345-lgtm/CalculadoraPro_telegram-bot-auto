@@ -11,8 +11,7 @@ const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const BASE_URL = process.env.BASE_URL;
-const ADMIN_KEY = process.env.ADMIN_KEY || '123456';
-const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || '').split(','); // IDs dos admins como strings
+const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || '').split(','); // IDs dos admins como string
 
 if (!TELEGRAM_TOKEN || !MP_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !BASE_URL) {
     console.error("❌ ERRO: Variáveis de ambiente não configuradas");
@@ -35,12 +34,21 @@ app.use(express.json());
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 bot.setWebHook(`${BASE_URL}/telegram-webhook`);
 
-// ===== DEVICE ID =====
+app.post('/telegram-webhook', async (req, res) => {
+    try {
+        await bot.processUpdate(req.body);
+        res.sendStatus(200);
+    } catch (err) {
+        console.error("❌ TELEGRAM:", err);
+        res.sendStatus(500);
+    }
+});
+
+// ===== HELPER =====
 function gerarDeviceId(msg) {
     return `${msg.from.id}_${msg.from.username || "no_user"}`;
 }
 
-// ===== REGISTRAR LOG SUSPEITO =====
 async function logSuspeito(chatId, action, info) {
     await supabase.from('logs_suspeitos').insert([{
         chat_id: chatId,
@@ -48,16 +56,13 @@ async function logSuspeito(chatId, action, info) {
         info,
         created_at: new Date()
     }]);
-    // alerta admins
     for (const adminId of ADMIN_CHAT_IDS) {
         bot.sendMessage(adminId, `⚠️ SUSPEITA: ${action} - ${info} (chat: ${chatId})`);
     }
 }
 
-// ===== VERIFICAR ACESSO =====
 async function verificarAcesso(chatId, msg) {
     const deviceAtual = gerarDeviceId(msg);
-
     const { data } = await supabase
         .from('usuarios')
         .select('*')
@@ -79,15 +84,15 @@ async function verificarAcesso(chatId, msg) {
 bot.setMyCommands([
     { command: '/start', description: 'Iniciar' },
     { command: '/comprar', description: 'Comprar acesso' },
-    { command: '/assinatura', description: 'Ver status' },
-    { command: '/relatorio', description: 'Relatório admin' }
+    { command: '/assinatura', description: 'Ver status' }
 ]);
 
 // ===== /start =====
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     const deviceAtual = gerarDeviceId(msg);
-    const ip = msg.ip || 'desconhecido'; // se tiver IP do webhook
+    const ip = msg.ip || 'desconhecido';
+    const agora = new Date();
 
     const { data: usuario } = await supabase
         .from('usuarios')
@@ -95,14 +100,10 @@ bot.onText(/\/start/, async (msg) => {
         .eq('chat_id', chatId)
         .single();
 
-    const agora = new Date();
-
     // Bloqueio por dispositivo diferente
     if (usuario && usuario.device_id && usuario.device_id !== deviceAtual) {
         await logSuspeito(chatId, "MULTI-DEVICE", `Tentativa de start em outro device: ${deviceAtual}`);
-        return bot.sendMessage(chatId,
-            "🚫 Conta já está em outro dispositivo.\n\nFale com o suporte."
-        );
+        return bot.sendMessage(chatId, "🚫 Conta já está em outro dispositivo.\n\nFale com o suporte.");
     }
 
     // Usuário já começou o trial antes
@@ -110,15 +111,12 @@ bot.onText(/\/start/, async (msg) => {
         const diasRestantes = Math.ceil((new Date(usuario.expires_at) - agora) / 86400000);
 
         if (diasRestantes > 0) {
-            // Ainda tem dias de trial
             return bot.sendMessage(chatId,
                 `👋 Bem-vindo de volta!\n🎁 Você ainda tem *${diasRestantes} dias* de trial.\n💰 Depois: R$10`,
                 { parse_mode: "Markdown" }
             );
         } else {
-            // Trial expirou → log de tentativa de burlar
             await logSuspeito(chatId, "START_APÓS_TRIAL", "Usuário tentou iniciar /start novamente após expirar o trial");
-
             return bot.sendMessage(chatId,
                 `👋 Bem-vindo de volta!\n❌ Seu trial expirou.\n💰 Use /comprar para liberar acesso.`,
                 { parse_mode: "Markdown" }
@@ -141,13 +139,14 @@ bot.onText(/\/start/, async (msg) => {
         last_login: agora
     });
 
-    bot.sendMessage(chatId,
-        `🎁 7 dias grátis liberados!\n💰 Depois: R$10`
-    );
+    bot.sendMessage(chatId, `🎁 7 dias grátis liberados!\n💰 Depois: R$10`);
 });
 
-// ===== /comprar =====
-async function criarPagamento(chatId) {
+// ===== CRIAR PAGAMENTO =====
+async function criarPagamento(msg) {
+    const chatId = msg.chat.id;
+    const deviceAtual = gerarDeviceId(msg);
+
     try {
         const { data: pagamentoAberto } = await supabase
             .from('pagamentos')
@@ -165,7 +164,11 @@ async function criarPagamento(chatId) {
             transaction_amount: 10,
             description: "Acesso Calculadora Pro",
             payment_method_id: "pix",
-            payer: { email: `user${chatId}@gmail.com` },
+            payer: {
+                email: `user${chatId}@gmail.com`,
+                first_name: msg.from.first_name,
+                device: { id: deviceAtual }
+            },
             metadata: { chat_id: chatId.toString() },
             external_reference: `user_${chatId}_${Date.now()}`,
             notification_url: `${BASE_URL}/webhook`,
@@ -186,7 +189,8 @@ async function criarPagamento(chatId) {
             chat_id: chatId,
             status: "pending",
             valor: 10,
-            token: result.id + "_" + chatId
+            token: result.id + "_" + chatId,
+            device_id: deviceAtual
         }]);
 
         return result;
@@ -198,9 +202,9 @@ async function criarPagamento(chatId) {
     }
 }
 
+// ===== /comprar =====
 bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
-
     const { data: usuario } = await supabase
         .from('usuarios')
         .select('*')
@@ -214,7 +218,7 @@ bot.onText(/\/comprar/, async (msg) => {
 
     bot.sendMessage(chatId, "⏳ Gerando PIX...");
 
-    const pagamento = await criarPagamento(chatId);
+    const pagamento = await criarPagamento(msg);
 
     if (!pagamento) {
         await supabase.from('usuarios')
@@ -224,11 +228,10 @@ bot.onText(/\/comprar/, async (msg) => {
     }
 
     const pix = pagamento.point_of_interaction?.transaction_data?.qr_code;
-
     if (!pix) return bot.sendMessage(chatId, "❌ PIX erro.");
 
     bot.sendMessage(chatId,
-        `💰 *PIX:*\n\`\`\`\n${pix}\n\`\`\`\n📲 Pague o PIX\n⚡ Liberação automática após pagamento.`,
+        `💰 PIX:\n\`\`\`\n${pix}\n\`\`\`\n📲 Pague o PIX\n⚡ Liberação automática após pagamento.`,
         { parse_mode: "Markdown" }
     );
 
@@ -255,24 +258,6 @@ bot.onText(/\/assinatura/, async (msg) => {
 
     const dias = Math.ceil((new Date(data.expires_at) - new Date()) / 86400000);
     bot.sendMessage(chatId, `✅ Ativo\nDias restantes: ${dias}`);
-});
-
-// ===== /relatorio (admin) =====
-bot.onText(/\/relatorio/, async (msg) => {
-    if (!ADMIN_CHAT_IDS.includes(msg.chat.id.toString())) {
-        return bot.sendMessage(msg.chat.id, "🚫 Você não tem permissão para acessar este comando.");
-    }
-
-    const { data: ativos } = await supabase.from('usuarios').select('*').eq('status', 'ativo');
-    const { data: expirados } = await supabase.from('usuarios').select('*').eq('status', 'expirado');
-    const { data: pendentes } = await supabase.from('pagamentos').select('*').eq('status', 'pending');
-
-    let texto = `📊 Relatório:\n\n`;
-    texto += `✅ Usuários ativos: ${ativos.length}\n`;
-    texto += `❌ Usuários expirados: ${expirados.length}\n`;
-    texto += `⏳ Pagamentos pendentes: ${pendentes.length}\n`;
-
-    await bot.sendMessage(msg.chat.id, texto);
 });
 
 // ===== WEBHOOK =====
@@ -305,12 +290,13 @@ app.post('/webhook', async (req, res) => {
             novaData.setDate(novaData.getDate() + 30);
 
             await supabase.from('usuarios')
-                .update({
+                .upsert({
+                    chat_id,
                     status: "ativo",
                     expires_at: novaData,
-                    tentativas_pix: 0
-                })
-                .eq('chat_id', chat_id);
+                    tentativas_pix: 0,
+                    device_id: pagamentoAtual.device_id
+                });
 
             bot.sendMessage(chat_id, `✅ Pagamento aprovado!\nAcesso liberado por 30 dias.`);
         }
@@ -319,17 +305,6 @@ app.post('/webhook', async (req, res) => {
 
     } catch (err) {
         console.error("❌ WEBHOOK:", err);
-        res.sendStatus(500);
-    }
-});
-
-// ===== TELEGRAM WEBHOOK =====
-app.post('/telegram-webhook', async (req, res) => {
-    try {
-        await bot.processUpdate(req.body);
-        res.sendStatus(200);
-    } catch (err) {
-        console.error("❌ TELEGRAM:", err);
         res.sendStatus(500);
     }
 });
