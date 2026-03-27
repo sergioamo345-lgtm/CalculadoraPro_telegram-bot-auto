@@ -104,7 +104,6 @@ bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
     let { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
 
-    // Se não existir, cria registro básico
     if (!usuario) {
         usuario = { chat_id: chatId, tentativas_pix: 0 };
         await supabase.from('usuarios').insert([{
@@ -192,4 +191,6 @@ Tentativas PIX: ${u.tentativas_pix}`;
         const { data: logs } = await supabase
             .from('logs_suspeitos')
             .select('*')
-            .
+            .limit(20)
+            .order('data', { ascending: false });
+        if (!logs || logs.length === 0) return bot
