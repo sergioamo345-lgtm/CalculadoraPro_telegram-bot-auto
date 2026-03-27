@@ -102,8 +102,20 @@ bot.onText(/\/start/, async (msg) => {
 // ===== /comprar =====
 bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
-    const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
-    if (!usuario) return bot.sendMessage(chatId, "🚫 Use /start antes de comprar.");
+    let { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
+
+    // Se não existir, cria registro básico
+    if (!usuario) {
+        usuario = { chat_id: chatId, tentativas_pix: 0 };
+        await supabase.from('usuarios').insert([{
+            chat_id: chatId,
+            status: "pendente_pagamento",
+            expires_at: new Date(),
+            ja_usou_trial: true,
+            tentativas_pix: 0
+        }]);
+    }
+
     if (usuario.tentativas_pix >= 3) {
         await logSuspeito(chatId, "ERRO_PIX", "Tentativas PIX excedidas");
         return bot.sendMessage(chatId, "❌ Você já tentou gerar PIX 3 vezes. Contate o suporte.");
@@ -117,7 +129,7 @@ bot.onText(/\/comprar/, async (msg) => {
             description: "Assinatura Calculadora Pro",
             payment_method_id: "pix",
             payer: { email: `${msg.from.username || 'anon'}@example.com` },
-            metadata: { chat_id: chatId.toString() } // melhoria: vincula pagamento ao chat_id
+            metadata: { chat_id: chatId.toString() }
         };
         const result = await mpPayment.create({ body: paymentData });
         bot.sendMessage(chatId, `💰 PIX:\n${result.point_of_interaction.transaction_data.qr_code}\n📲 Pague e liberação automática.`);
@@ -138,27 +150,46 @@ bot.onText(/\/assinatura/, async (msg) => {
 });
 
 // ===== /admin =====
-// ... (mantive igual ao seu, sem alterações)
+bot.onText(/\/admin/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (!ADMIN_IDS.includes(chatId)) return;
 
-// ===== Webhook Mercado Pago =====
-app.post('/webhook', async (req, res) => {
-    const { id, type } = req.body;
-    if (type !== 'payment') return res.sendStatus(200);
-    try {
-        const result = await mpPayment.get({ id });
-        const chatId = result.metadata?.chat_id; // melhoria: usa metadata.chat_id
-        if (chatId) {
-            const novaData = new Date();
-            novaData.setMonth(novaData.getMonth() + 1);
-            await supabase.from('usuarios').update({ status: "ativo", expires_at: novaData, tentativas_pix: 0 }).eq('chat_id', chatId);
-            bot.sendMessage(chatId, "✅ Pagamento confirmado! Acesso liberado por 1 mês.");
-        }
-        res.sendStatus(200);
-    } catch (err) {
-        console.log("❌ WEBHOOK ERROR:", err);
-        res.sendStatus(500);
-    }
+    const keyboard = {
+        inline_keyboard: [
+            [{ text: "👥 Ver usuários ativos", callback_data: "ADMIN_LIST_USERS" }],
+            [{ text: "⚠️ Ver logs suspeitos", callback_data: "ADMIN_LIST_LOGS" }]
+        ]
+    };
+    bot.sendMessage(chatId, "⚡ Menu de Admin:", { reply_markup: keyboard });
 });
 
-// ===== Start Express =====
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+// ===== CALLBACKS DE ADMIN =====
+bot.on('callback_query', async (callbackQuery) => {
+    const chatId = callbackQuery.from.id;
+    const data = callbackQuery.data;
+    if (!ADMIN_IDS.includes(chatId)) return;
+
+    if (data === "ADMIN_LIST_USERS") {
+        const { data: usuarios } = await supabase.from('usuarios').select('*');
+        if (!usuarios || usuarios.length === 0) return bot.sendMessage(chatId, "❌ Nenhum usuário encontrado.");
+        for (const u of usuarios) {
+            const text = `👤 Usuário: ${u.chat_id}
+Status: ${u.status}
+Expira: ${u.expires_at}
+Tentativas PIX: ${u.tentativas_pix}`;
+            const keyboard = {
+                inline_keyboard: [
+                    [{ text: "🚫 Bloquear", callback_data: `BLOCK_${u.chat_id}` }],
+                    [{ text: "✅ Liberar", callback_data: `UNBLOCK_${u.chat_id}` }],
+                    [{ text: "🔄 Reset Trial", callback_data: `RESET_${u.chat_id}` }]
+                ]
+            };
+            await bot.sendMessage(chatId, text, { reply_markup: keyboard });
+        }
+    }
+
+    if (data === "ADMIN_LIST_LOGS") {
+        const { data: logs } = await supabase
+            .from('logs_suspeitos')
+            .select('*')
+            .
