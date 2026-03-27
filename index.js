@@ -20,25 +20,26 @@ const ADMIN_IDS       = (process.env.ADMIN_IDS || "")
   .split(",")
   .map((id) => id.trim())
   .filter(Boolean);
-const PORT            = parseInt(process.env.PORT || "10000", 10);
+const PORT = parseInt(process.env.PORT || "10000", 10);
 
 if (!TELEGRAM_TOKEN || !SUPABASE_URL || !SUPABASE_KEY || !MP_ACCESS_TOKEN) {
-  console.error("❌  Variáveis de ambiente obrigatórias não definidas.");
+  console.error("Variaveis de ambiente obrigatorias nao definidas.");
   process.exit(1);
 }
 
 // ── Clients ──────────────────────────────────────────────────
-const bot     = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const bot      = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app      = express();
 app.use(express.json());
 
+// Cache em memoria para QR codes PIX (payment_id -> qr_code string)
+const pixCache = new Map();
+
 // ── Helpers ──────────────────────────────────────────────────
 
-/** Verifica se chat_id é admin */
 const isAdmin = (chatId) => ADMIN_IDS.includes(String(chatId));
 
-/** Retorna a data atual + dias */
 const futureDate = (days) => {
   const d = new Date();
   d.setDate(d.getDate() + days);
@@ -46,61 +47,68 @@ const futureDate = (days) => {
 };
 
 /**
- * Busca ou cria usuário no Supabase.
- * @param {string|number} chatId
- * @param {object}        extra   – campos opcionais para upsert
+ * Busca usuario no Supabase. Retorna null se nao existir.
  */
-async function getOrCreateUser(chatId, extra = {}) {
+async function getUser(chatId) {
   const { data, error } = await supabase
     .from("usuarios")
     .select("*")
     .eq("chat_id", String(chatId))
     .maybeSingle();
 
-  if (error) throw error;
-  if (data) return data;
-
-  const newUser = {
-    chat_id:         String(chatId),
-    status:          "trial",
-    trial_expira:    futureDate(7),
-    tentativas_pix:  0,
-    device_id:       extra.device_id || null,
-    ip:              extra.ip        || null,
-    criado_em:       new Date().toISOString(),
-  };
-
-  const { data: created, error: err2 } = await supabase
-    .from("usuarios")
-    .insert(newUser)
-    .select()
-    .single();
-
-  if (err2) throw err2;
-  return created;
+  if (error) {
+    console.error("[getUser] Supabase error:", JSON.stringify(error));
+    throw new Error(error.message || JSON.stringify(error));
+  }
+  return data;
 }
 
 /**
- * Verifica se o usuário tem acesso ativo.
- * @returns {{ ok: boolean, motivo: string }}
+ * Cria novo usuario no Supabase.
+ */
+async function createUser(chatId, deviceId, ip) {
+  const { data, error } = await supabase
+    .from("usuarios")
+    .insert({
+      chat_id:        String(chatId),
+      status:         "trial",
+      trial_expira:   futureDate(7),
+      tentativas_pix: 0,
+      device_id:      deviceId || null,
+      ip:             ip || null,
+      bloqueado:      false,
+      criado_em:      new Date().toISOString(),
+    })
+    .select()
+    .single();
+
+  if (error) {
+    console.error("[createUser] Supabase error:", JSON.stringify(error));
+    throw new Error(error.message || JSON.stringify(error));
+  }
+  return data;
+}
+
+/**
+ * Verifica se o usuario tem acesso ativo.
  */
 async function verificarAcesso(chatId) {
-  const { data: user, error } = await supabase
-    .from("usuarios")
-    .select("*")
-    .eq("chat_id", String(chatId))
-    .maybeSingle();
+  let user;
+  try {
+    user = await getUser(chatId);
+  } catch (e) {
+    return { ok: false, motivo: "Erro ao consultar banco: " + e.message };
+  }
 
-  if (error || !user) return { ok: false, motivo: "Usuário não encontrado. Use /start." };
-  if (user.bloqueado)  return { ok: false, motivo: "Sua conta está bloqueada. Fale com o suporte." };
-
+  if (!user)           return { ok: false, motivo: "Usuario nao encontrado. Use /start." };
+  if (user.bloqueado)  return { ok: false, motivo: "Sua conta esta bloqueada. Fale com o suporte." };
   if (user.status === "ativo") return { ok: true, motivo: "Acesso ativo (assinatura paga)." };
 
   if (user.status === "trial") {
     const expira = new Date(user.trial_expira);
     if (expira > new Date()) {
       const dias = Math.ceil((expira - new Date()) / 86_400_000);
-      return { ok: true, motivo: `Trial ativo – faltam ${dias} dia(s).` };
+      return { ok: true, motivo: `Trial ativo - faltam ${dias} dia(s).` };
     }
     return { ok: false, motivo: "Seu trial expirou. Use /comprar para assinar." };
   }
@@ -109,30 +117,30 @@ async function verificarAcesso(chatId) {
 }
 
 /**
- * Registra log suspeito.
+ * Registra log suspeito. Nao lanca erro para nao interromper o fluxo.
  */
 async function registrarLogSuspeito(chatId, tipo, detalhe) {
-  await supabase.from("logs_suspeitos").insert({
-    chat_id:    String(chatId),
+  const { error } = await supabase.from("logs_suspeitos").insert({
+    chat_id:   String(chatId),
     tipo,
     detalhe,
-    criado_em:  new Date().toISOString(),
+    criado_em: new Date().toISOString(),
   });
+  if (error) console.error("[logSuspeito]", error.message);
 }
 
 /**
  * Cria pagamento PIX no Mercado Pago.
- * @returns {{ qr_code, qr_code_base64, payment_id }}
  */
 async function criarPIX(chatId) {
   const body = {
     transaction_amount: 10,
-    description:        "CalculadoraPro – Assinatura mensal",
+    description:        "CalculadoraPro - Assinatura mensal",
     payment_method_id:  "pix",
     payer: {
-      email:            `usuario_${chatId}@calculadorapro.bot`,
-      first_name:       "Usuario",
-      last_name:        "Bot",
+      email:          "usuario_" + chatId + "@calculadorapro.bot",
+      first_name:     "Usuario",
+      last_name:      "Bot",
       identification: { type: "CPF", number: "00000000000" },
     },
     external_reference: String(chatId),
@@ -143,68 +151,62 @@ async function criarPIX(chatId) {
     body,
     {
       headers: {
-        Authorization:  `Bearer ${MP_ACCESS_TOKEN}`,
-        "Content-Type": "application/json",
-        "X-Idempotency-Key": `pix-${chatId}-${Date.now()}`,
+        Authorization:       "Bearer " + MP_ACCESS_TOKEN,
+        "Content-Type":      "application/json",
+        "X-Idempotency-Key": "pix-" + chatId + "-" + Date.now(),
       },
     }
   );
 
   return {
-    payment_id:      data.id,
-    qr_code:         data.point_of_interaction?.transaction_data?.qr_code,
-    qr_code_base64:  data.point_of_interaction?.transaction_data?.qr_code_base64,
+    payment_id:     data.id,
+    qr_code:        data.point_of_interaction &&
+                    data.point_of_interaction.transaction_data &&
+                    data.point_of_interaction.transaction_data.qr_code,
+    qr_code_base64: data.point_of_interaction &&
+                    data.point_of_interaction.transaction_data &&
+                    data.point_of_interaction.transaction_data.qr_code_base64,
   };
 }
 
 // ── /start ───────────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
   const chatId   = msg.chat.id;
-  const username = msg.from?.username || "sem_user";
-
-  // IP simulado (Telegram não expõe IP real; use um proxy reverso p/ obter)
-  const fakeIp   = "0.0.0.0";
-  const deviceId = `tg_${chatId}`;
+  const username = (msg.from && (msg.from.username || msg.from.first_name)) || "usuario";
+  const deviceId = "tg_" + chatId;
 
   try {
-    // Verifica se já existe
-    const { data: existing } = await supabase
-      .from("usuarios")
-      .select("*")
-      .eq("chat_id", String(chatId))
-      .maybeSingle();
+    const existing = await getUser(chatId);
 
     if (existing) {
-      // Checagem multi-device / multi-IP
       if (existing.device_id && existing.device_id !== deviceId) {
         await registrarLogSuspeito(chatId, "multi_device",
-          `device anterior: ${existing.device_id} | novo: ${deviceId}`);
-      }
-      if (existing.ip && existing.ip !== fakeIp && fakeIp !== "0.0.0.0") {
-        await registrarLogSuspeito(chatId, "multi_ip",
-          `IP anterior: ${existing.ip} | novo: ${fakeIp}`);
+          "device anterior: " + existing.device_id + " | novo: " + deviceId);
       }
 
-      await bot.sendMessage(chatId,
-        `👋 Bem-vindo de volta, *${username}*!\n\nUse /assinatura para ver seu status.`,
-        { parse_mode: "Markdown" });
+      await bot.sendMessage(
+        chatId,
+        "Bem-vindo de volta, *" + username + "*!\n\nUse /assinatura para ver seu status.",
+        { parse_mode: "Markdown" }
+      );
       return;
     }
 
-    // Cria novo usuário com trial de 7 dias
-    await getOrCreateUser(chatId, { device_id: deviceId, ip: fakeIp });
+    await createUser(chatId, deviceId, null);
 
-    await bot.sendMessage(chatId,
-      `🎉 Bem-vindo ao *CalculadoraPro*, ${username}!\n\n` +
-      `✅ Seu *trial gratuito de 7 dias* foi ativado.\n\n` +
-      `📌 Comandos disponíveis:\n` +
-      `/assinatura – ver status\n` +
-      `/comprar – assinar por R$10/mês\n`,
-      { parse_mode: "Markdown" });
+    await bot.sendMessage(
+      chatId,
+      "Bem-vindo ao *CalculadoraPro*, " + username + "!\n\n" +
+      "Seu *trial gratuito de 7 dias* foi ativado.\n\n" +
+      "Comandos disponiveis:\n" +
+      "/assinatura - ver status\n" +
+      "/comprar - assinar por R$10/mes",
+      { parse_mode: "Markdown" }
+    );
 
   } catch (err) {
-    console.error("[/start]", err.message);
-    await bot.sendMessage(chatId, "❌ Erro ao iniciar. Tente novamente.");
+    console.error("[/start] ERRO:", err.message);
+    await bot.sendMessage(chatId, "Erro ao iniciar: " + err.message);
   }
 });
 
@@ -213,12 +215,14 @@ bot.onText(/\/assinatura/, async (msg) => {
   const chatId = msg.chat.id;
   try {
     const { ok, motivo } = await verificarAcesso(chatId);
-    const icone = ok ? "✅" : "❌";
-    await bot.sendMessage(chatId, `${icone} *Status da assinatura*\n\n${motivo}`,
-      { parse_mode: "Markdown" });
+    const icone = ok ? "Ativo" : "Inativo";
+    await bot.sendMessage(chatId,
+      icone + " - *Status da assinatura*\n\n" + motivo,
+      { parse_mode: "Markdown" }
+    );
   } catch (err) {
     console.error("[/assinatura]", err.message);
-    await bot.sendMessage(chatId, "❌ Erro ao verificar assinatura.");
+    await bot.sendMessage(chatId, "Erro ao verificar assinatura: " + err.message);
   }
 });
 
@@ -227,20 +231,26 @@ bot.onText(/\/comprar/, async (msg) => {
   const chatId = msg.chat.id;
 
   try {
-    // Incrementa tentativas_pix
-    await supabase
-      .from("usuarios")
-      .update({ tentativas_pix: supabase.rpc("increment", { x: 1 }) })
-      .eq("chat_id", String(chatId));
+    // Incrementa tentativas_pix de forma segura (sem rpc)
+    const user = await getUser(chatId);
+    if (user) {
+      await supabase
+        .from("usuarios")
+        .update({ tentativas_pix: (user.tentativas_pix || 0) + 1 })
+        .eq("chat_id", String(chatId));
+    }
 
-    await bot.sendMessage(chatId, "⏳ Gerando seu PIX de R$10,00…");
+    await bot.sendMessage(chatId, "Gerando seu PIX de R$10,00...");
 
     const { payment_id, qr_code, qr_code_base64 } = await criarPIX(chatId);
 
     if (!qr_code) {
-      await bot.sendMessage(chatId, "❌ Não foi possível gerar o PIX. Tente novamente.");
+      await bot.sendMessage(chatId, "Nao foi possivel gerar o PIX. Tente novamente.");
       return;
     }
+
+    // Armazena no cache ANTES de enviar
+    pixCache.set(String(payment_id), qr_code);
 
     // Registra pagamento pendente
     await supabase.from("pagamentos").insert({
@@ -251,60 +261,56 @@ bot.onText(/\/comprar/, async (msg) => {
       criado_em:  new Date().toISOString(),
     });
 
-    // Envia QR Code (imagem base64 → buffer)
+    // Envia QR Code como imagem, se disponivel
     if (qr_code_base64) {
-      const imgBuffer = Buffer.from(qr_code_base64, "base64");
-      await bot.sendPhoto(chatId, imgBuffer, {
-        caption: `💸 *PIX de R$10,00 gerado!*\n\nEscaneie o QR Code ou copie o código abaixo 👇`,
-        parse_mode: "Markdown",
-      });
+      try {
+        const imgBuffer = Buffer.from(qr_code_base64, "base64");
+        await bot.sendPhoto(chatId, imgBuffer, {
+          caption:    "PIX de R$10,00 gerado! Escaneie o QR Code ou use o botao abaixo.",
+          parse_mode: "Markdown",
+        });
+      } catch (imgErr) {
+        console.error("[/comprar] Erro ao enviar imagem QR:", imgErr.message);
+      }
     }
 
-    // Envia código PIX com botão inline "Copiar"
-    await bot.sendMessage(chatId,
-      `\`${qr_code}\``,
+    // Envia codigo PIX com botao inline
+    await bot.sendMessage(
+      chatId,
+      "Codigo PIX (toque para copiar):\n\n`" + qr_code + "`",
       {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [[
-            {
-              text:          "📋 Copiar código PIX",
-              callback_data: `copiar_pix:${payment_id}`,
-            },
+            { text: "Copiar codigo PIX", callback_data: "copiar_pix:" + payment_id },
           ]],
         },
       }
     );
 
-    // Armazena qr_code temporariamente para callback
-    pixCache.set(String(payment_id), qr_code);
-
   } catch (err) {
     console.error("[/comprar]", err.message);
-    await bot.sendMessage(chatId, "❌ Erro ao gerar PIX. Tente novamente mais tarde.");
+    await bot.sendMessage(chatId, "Erro ao gerar PIX: " + err.message);
   }
 });
-
-// Cache em memória para QR codes (evita nova consulta ao MP)
-const pixCache = new Map();
 
 // ── /admin ───────────────────────────────────────────────────
 bot.onText(/\/admin/, async (msg) => {
   const chatId = msg.chat.id;
   if (!isAdmin(chatId)) {
-    await bot.sendMessage(chatId, "⛔ Acesso negado.");
+    await bot.sendMessage(chatId, "Acesso negado.");
     return;
   }
 
-  await bot.sendMessage(chatId, "🔧 *Painel Admin – CalculadoraPro*", {
+  await bot.sendMessage(chatId, "*Painel Admin - CalculadoraPro*", {
     parse_mode: "Markdown",
     reply_markup: {
       inline_keyboard: [
-        [{ text: "👥 Ver usuários",         callback_data: "admin:listar_usuarios" }],
-        [{ text: "🚫 Bloquear usuário",      callback_data: "admin:bloquear_prompt" }],
-        [{ text: "✅ Liberar usuário",        callback_data: "admin:liberar_prompt"  }],
-        [{ text: "🔄 Reset trial",            callback_data: "admin:reset_trial_prompt" }],
-        [{ text: "⚠️ Logs suspeitos",         callback_data: "admin:logs_suspeitos"  }],
+        [{ text: "Ver usuarios",    callback_data: "admin:listar_usuarios"    }],
+        [{ text: "Bloquear usuario", callback_data: "admin:bloquear_prompt"  }],
+        [{ text: "Liberar usuario",  callback_data: "admin:liberar_prompt"   }],
+        [{ text: "Reset trial",      callback_data: "admin:reset_trial_prompt" }],
+        [{ text: "Logs suspeitos",   callback_data: "admin:logs_suspeitos"   }],
       ],
     },
   });
@@ -312,60 +318,62 @@ bot.onText(/\/admin/, async (msg) => {
 
 // ── Callback query handler ───────────────────────────────────
 bot.on("callback_query", async (query) => {
-  const chatId   = query.message.chat.id;
-  const msgId    = query.message.message_id;
-  const data     = query.data || "";
+  const chatId = query.message.chat.id;
+  const data   = query.data || "";
 
   // ── Copiar PIX ──────────────────────────────────────────────
   if (data.startsWith("copiar_pix:")) {
-    const paymentId = data.split(":")[1];
+    const paymentId = data.replace("copiar_pix:", "");
     const qrCode    = pixCache.get(paymentId);
 
     if (!qrCode) {
       await bot.answerCallbackQuery(query.id, {
-        text:       "⚠️ Código PIX não encontrado. Gere um novo com /comprar.",
+        text:       "Codigo expirado. Gere um novo com /comprar.",
         show_alert: true,
       });
       return;
     }
 
-    // Envia como mensagem separada para o usuário copiar facilmente
-    await bot.sendMessage(chatId,
-      `📋 *Código PIX (toque para copiar):*\n\n\`${qrCode}\``,
-      { parse_mode: "Markdown" });
-
-    await bot.answerCallbackQuery(query.id, { text: "✅ Código PIX enviado!" });
+    await bot.sendMessage(
+      chatId,
+      "Codigo PIX (toque para copiar):\n\n`" + qrCode + "`",
+      { parse_mode: "Markdown" }
+    );
+    await bot.answerCallbackQuery(query.id, { text: "Codigo PIX enviado!" });
     return;
   }
 
   // ── Admin callbacks ─────────────────────────────────────────
   if (!isAdmin(chatId)) {
-    await bot.answerCallbackQuery(query.id, { text: "⛔ Acesso negado.", show_alert: true });
+    await bot.answerCallbackQuery(query.id, { text: "Acesso negado.", show_alert: true });
     return;
   }
 
   if (data === "admin:listar_usuarios") {
     await bot.answerCallbackQuery(query.id);
     try {
-      const { data: usuarios } = await supabase
+      const { data: usuarios, error } = await supabase
         .from("usuarios")
         .select("chat_id, status, trial_expira, bloqueado, tentativas_pix")
         .order("criado_em", { ascending: false })
         .limit(20);
 
-      if (!usuarios?.length) {
-        await bot.sendMessage(chatId, "Nenhum usuário cadastrado.");
+      if (error) throw new Error(error.message);
+      if (!usuarios || usuarios.length === 0) {
+        await bot.sendMessage(chatId, "Nenhum usuario cadastrado ainda.");
         return;
       }
 
       const linhas = usuarios.map((u) =>
-        `• \`${u.chat_id}\` – ${u.status}${u.bloqueado ? " 🚫" : ""} | PIX: ${u.tentativas_pix}`
+        "- `" + u.chat_id + "` - " + u.status + (u.bloqueado ? " [BLOQUEADO]" : "") + " | PIX: " + (u.tentativas_pix || 0)
       );
-      await bot.sendMessage(chatId,
-        `👥 *Usuários (últimos 20):*\n\n${linhas.join("\n")}`,
-        { parse_mode: "Markdown" });
+      await bot.sendMessage(
+        chatId,
+        "*Usuarios (ultimos 20):*\n\n" + linhas.join("\n"),
+        { parse_mode: "Markdown" }
+      );
     } catch (err) {
-      await bot.sendMessage(chatId, `Erro: ${err.message}`);
+      await bot.sendMessage(chatId, "Erro: " + err.message);
     }
     return;
   }
@@ -373,68 +381,83 @@ bot.on("callback_query", async (query) => {
   if (data === "admin:logs_suspeitos") {
     await bot.answerCallbackQuery(query.id);
     try {
-      const { data: logs } = await supabase
+      const { data: logs, error } = await supabase
         .from("logs_suspeitos")
         .select("*")
         .order("criado_em", { ascending: false })
         .limit(15);
 
-      if (!logs?.length) {
+      if (error) throw new Error(error.message);
+      if (!logs || logs.length === 0) {
         await bot.sendMessage(chatId, "Nenhum log suspeito registrado.");
         return;
       }
 
       const linhas = logs.map((l) =>
-        `⚠️ \`${l.chat_id}\` – *${l.tipo}*\n   ${l.detalhe}`
+        "[" + l.chat_id + "] " + l.tipo + ": " + l.detalhe
       );
-      await bot.sendMessage(chatId,
-        `⚠️ *Logs suspeitos (últimos 15):*\n\n${linhas.join("\n\n")}`,
-        { parse_mode: "Markdown" });
+      await bot.sendMessage(
+        chatId,
+        "*Logs suspeitos (ultimos 15):*\n\n" + linhas.join("\n\n")
+      );
     } catch (err) {
-      await bot.sendMessage(chatId, `Erro: ${err.message}`);
+      await bot.sendMessage(chatId, "Erro: " + err.message);
     }
     return;
   }
 
-  // Prompts de ação (bloquear / liberar / reset) pedem ID via resposta
-  if (["admin:bloquear_prompt", "admin:liberar_prompt", "admin:reset_trial_prompt"].includes(data)) {
+  // Prompts admin: bloquear / liberar / reset trial
+  const promptActions = ["admin:bloquear_prompt", "admin:liberar_prompt", "admin:reset_trial_prompt"];
+  if (promptActions.includes(data)) {
     await bot.answerCallbackQuery(query.id);
     const acao = data.split(":")[1];
     const textos = {
-      bloquear_prompt:    "🚫 Digite o chat_id do usuário a *bloquear*:",
-      liberar_prompt:     "✅ Digite o chat_id do usuário a *liberar*:",
-      reset_trial_prompt: "🔄 Digite o chat_id para *resetar o trial* (+ 7 dias):",
+      bloquear_prompt:    "Envie o chat_id do usuario a bloquear:",
+      liberar_prompt:     "Envie o chat_id do usuario a liberar:",
+      reset_trial_prompt: "Envie o chat_id para resetar o trial (+7 dias):",
     };
-    await bot.sendMessage(chatId, textos[acao], {
-      parse_mode: "Markdown",
+
+    const promptMsg = await bot.sendMessage(chatId, textos[acao], {
       reply_markup: { force_reply: true },
     });
 
-    // Aguarda resposta do admin
-    bot.once("message", async (reply) => {
+    const listener = async (reply) => {
       if (reply.chat.id !== chatId) return;
-      const targetId = reply.text?.trim();
-      if (!targetId) return;
+      if (!reply.reply_to_message || reply.reply_to_message.message_id !== promptMsg.message_id) return;
+
+      bot.removeListener("message", listener);
+
+      const targetId = reply.text && reply.text.trim();
+      if (!targetId) {
+        await bot.sendMessage(chatId, "Nenhum ID fornecido.");
+        return;
+      }
 
       try {
         if (acao === "bloquear_prompt") {
-          await supabase.from("usuarios").update({ bloqueado: true }).eq("chat_id", targetId);
-          await bot.sendMessage(chatId, `🚫 Usuário \`${targetId}\` bloqueado.`, { parse_mode: "Markdown" });
+          const { error } = await supabase.from("usuarios").update({ bloqueado: true }).eq("chat_id", targetId);
+          if (error) throw new Error(error.message);
+          await bot.sendMessage(chatId, "Usuario `" + targetId + "` bloqueado.", { parse_mode: "Markdown" });
 
         } else if (acao === "liberar_prompt") {
-          await supabase.from("usuarios").update({ bloqueado: false, status: "ativo" }).eq("chat_id", targetId);
-          await bot.sendMessage(chatId, `✅ Usuário \`${targetId}\` liberado.`, { parse_mode: "Markdown" });
+          const { error } = await supabase.from("usuarios")
+            .update({ bloqueado: false, status: "ativo" }).eq("chat_id", targetId);
+          if (error) throw new Error(error.message);
+          await bot.sendMessage(chatId, "Usuario `" + targetId + "` liberado.", { parse_mode: "Markdown" });
 
         } else if (acao === "reset_trial_prompt") {
-          await supabase.from("usuarios")
+          const { error } = await supabase.from("usuarios")
             .update({ status: "trial", trial_expira: futureDate(7), bloqueado: false })
             .eq("chat_id", targetId);
-          await bot.sendMessage(chatId, `🔄 Trial de \`${targetId}\` resetado por mais 7 dias.`, { parse_mode: "Markdown" });
+          if (error) throw new Error(error.message);
+          await bot.sendMessage(chatId, "Trial de `" + targetId + "` resetado por 7 dias.", { parse_mode: "Markdown" });
         }
       } catch (err) {
-        await bot.sendMessage(chatId, `Erro: ${err.message}`);
+        await bot.sendMessage(chatId, "Erro: " + err.message);
       }
-    });
+    };
+
+    bot.on("message", listener);
     return;
   }
 
@@ -444,19 +467,21 @@ bot.on("callback_query", async (query) => {
 // ── Webhook Mercado Pago ──────────────────────────────────────
 app.post("/webhook", async (req, res) => {
   try {
-    const { type, data } = req.body;
+    const body = req.body;
+    console.log("[webhook] recebido:", JSON.stringify(body));
 
-    if (type !== "payment") {
-      return res.sendStatus(200);
+    // MP pode enviar "data.id" ou "resource" com a URL contendo o ID
+    let paymentId = body && body.data && body.data.id;
+    if (!paymentId && body && body.resource) {
+      const match = String(body.resource).match(/(\d+)$/);
+      if (match) paymentId = match[1];
     }
 
-    const paymentId = data?.id;
     if (!paymentId) return res.sendStatus(200);
 
-    // Consulta o pagamento no MP
     const { data: mpData } = await axios.get(
-      `https://api.mercadopago.com/v1/payments/${paymentId}`,
-      { headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` } }
+      "https://api.mercadopago.com/v1/payments/" + paymentId,
+      { headers: { Authorization: "Bearer " + MP_ACCESS_TOKEN } }
     );
 
     if (mpData.status !== "approved") return res.sendStatus(200);
@@ -464,48 +489,47 @@ app.post("/webhook", async (req, res) => {
     const chatId = mpData.external_reference;
     if (!chatId) return res.sendStatus(200);
 
-    // Atualiza pagamento no Supabase
     await supabase
       .from("pagamentos")
       .update({ status: "aprovado", atualizado_em: new Date().toISOString() })
       .eq("payment_id", String(paymentId));
 
-    // Libera acesso
     const expira = futureDate(30);
     await supabase
       .from("usuarios")
       .update({ status: "ativo", assinatura_expira: expira, bloqueado: false })
       .eq("chat_id", String(chatId));
 
-    // Notifica usuário
-    await bot.sendMessage(chatId,
-      `🎉 *Pagamento confirmado!*\n\n` +
-      `✅ Sua assinatura do *CalculadoraPro* está ativa por 30 dias.\n` +
-      `📅 Válida até: ${new Date(expira).toLocaleDateString("pt-BR")}`,
-      { parse_mode: "Markdown" });
+    await bot.sendMessage(
+      chatId,
+      "*Pagamento confirmado!*\n\n" +
+      "Assinatura do *CalculadoraPro* ativa por 30 dias.\n" +
+      "Valida ate: " + new Date(expira).toLocaleDateString("pt-BR"),
+      { parse_mode: "Markdown" }
+    );
 
-    console.log(`[webhook] Pagamento ${paymentId} aprovado para chat_id ${chatId}`);
+    console.log("[webhook] Pagamento " + paymentId + " aprovado para chat_id " + chatId);
     res.sendStatus(200);
 
   } catch (err) {
-    console.error("[webhook]", err.message);
+    console.error("[webhook] ERRO:", err.message);
     res.sendStatus(500);
   }
 });
 
 // Health check
-app.get("/", (_req, res) => res.send("CalculadoraPro bot online ✅"));
+app.get("/", (_req, res) => res.send("CalculadoraPro bot online"));
 
 // ── Express listen ───────────────────────────────────────────
-app.listen(PORT, () => console.log(`🚀 Servidor Express na porta ${PORT}`));
+app.listen(PORT, () => console.log("Servidor Express na porta " + PORT));
 
 // ── Error handling global ────────────────────────────────────
 process.on("unhandledRejection", (reason) => {
-  console.error("⚠️  unhandledRejection:", reason);
+  console.error("unhandledRejection:", reason);
 });
 
 process.on("uncaughtException", (err) => {
-  console.error("💥 uncaughtException:", err.message);
+  console.error("uncaughtException:", err.message);
 });
 
-console.log("🤖 CalculadoraPro bot iniciado com polling…");
+console.log("CalculadoraPro bot iniciado com polling...");
