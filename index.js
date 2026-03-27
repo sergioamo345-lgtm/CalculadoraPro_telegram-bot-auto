@@ -91,7 +91,6 @@ async function criarPagamento(chatId) {
         };
 
         const result = await payment.create({ body: paymentData });
-
         const paymentId = result.id;
 
         await supabase.from('pagamentos').insert([{
@@ -127,7 +126,6 @@ bot.onText(/\/comprar/, async (msg) => {
         return bot.sendMessage(chatId, "❌ PIX não gerado.");
     }
 
-    // 💬 MENSAGEM EXPLICATIVA (O QUE VOCÊ PEDIU)
     bot.sendMessage(chatId,
         `💰 *PIX:*\n\`\`\`\n${pix}\n\`\`\`\n\n` +
         `📲 Pague o PIX acima.\n\n` +
@@ -169,13 +167,17 @@ app.post('/webhook', async (req, res) => {
     try {
         console.log("🔥 WEBHOOK:", req.body);
 
-        const paymentId = req.body.data?.id;
+        // 🔥 SUPORTE COMPLETO (formato novo + antigo)
+        const paymentId = req.body.data?.id || req.body.resource;
+
         if (!paymentId) return res.sendStatus(200);
 
         const result = await payment.get({ id: paymentId });
 
         const status = result.status;
         const chat_id = result.metadata?.chat_id;
+
+        console.log(`💰 ID: ${paymentId} | STATUS: ${status}`);
 
         await supabase
             .from('pagamentos')
