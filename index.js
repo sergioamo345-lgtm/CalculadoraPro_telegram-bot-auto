@@ -1,19 +1,19 @@
-// index.js
 const express = require('express');
 const cors = require('cors');
 const QRCode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
 const TelegramBot = require('node-telegram-bot-api');
-const mercadopago = require('mercadopago');
+
+// ✅ NOVO SDK MERCADO PAGO
+const { MercadoPagoConfig, Payment } = require('mercadopago');
 
 // ===== CONFIG =====
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const BASE_URL = process.env.BASE_URL; // ex: https://seuapp.onrender.com
+const BASE_URL = process.env.BASE_URL;
 const ADMIN_KEY = process.env.ADMIN_KEY || '123456';
-const MP_MODE = process.env.MP_MODE || 'sandbox'; // 'sandbox' ou 'live'
 
 if (!TELEGRAM_TOKEN || !MP_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !BASE_URL) {
     console.error("❌ ERRO: Variáveis de ambiente não configuradas");
@@ -24,7 +24,10 @@ if (!TELEGRAM_TOKEN || !MP_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // ===== MERCADO PAGO =====
-mercadopago.configure({ access_token: MP_TOKEN });
+const client = new MercadoPagoConfig({
+    accessToken: MP_TOKEN
+});
+const payment = new Payment(client);
 
 // ===== EXPRESS =====
 const app = express();
@@ -40,82 +43,68 @@ app.post(`/telegram-webhook`, async (req, res) => {
         await bot.processUpdate(req.body);
         res.sendStatus(200);
     } catch (err) {
-        console.error("❌ ERRO TELEGRAM WEBHOOK:", err);
+        console.error("❌ ERRO TELEGRAM:", err);
         res.sendStatus(500);
     }
 });
 
-// ===== BOT COMANDOS =====
+// ===== COMANDOS =====
 bot.setMyCommands([
-    { command: '/start', description: 'Começar a usar o bot' },
-    { command: '/comprar', description: 'Comprar assinatura 30 dias R$10' },
-    { command: '/assinatura', description: 'Ver status da assinatura' }
+    { command: '/start', description: 'Iniciar' },
+    { command: '/comprar', description: 'Comprar acesso' },
+    { command: '/assinatura', description: 'Ver status' }
 ]);
 
 // /start
 bot.onText(/\/start/, (msg) => {
-    const chatId = msg.chat.id;
-    bot.sendMessage(chatId,
-        `👋 Olá *${msg.from.first_name}*!\n\n` +
-        `Você tem *7 dias grátis*.\nDepois disso: R$10 por 30 dias.\n\n` +
-        `Use /comprar para liberar acesso.`,
-        { parse_mode: 'Markdown' }
+    bot.sendMessage(msg.chat.id,
+        `👋 Olá ${msg.from.first_name}!\n\n` +
+        `🎁 Você tem 7 dias grátis\n\n` +
+        `💰 Depois: R$10 por 30 dias\n\n` +
+        `👉 Use /comprar`
     );
 });
 
-// ===== CRIAR PAGAMENTO =====
+// ===== PAGAMENTO =====
 async function criarPagamento(chatId) {
     try {
         const paymentData = {
             transaction_amount: 10,
-            description: "Acesso Calculadora Moto Pro",
-            payment_method_id: "pix", // ou "visa" para cartão
+            description: "Acesso Calculadora Pro",
+            payment_method_id: "pix",
             payer: {
-                email: `user${chatId}@example.com`, // em produção, use email real
-                first_name: "Nome",
-                last_name: "Sobrenome"
-                // address, identification, phone → se tiver
+                email: `user${chatId}@gmail.com`
             },
-            metadata: { chat_id: chatId.toString(), mode: MP_MODE },
-            external_reference: `assinatura_${chatId}_${Date.now()}`, // 🔑 referência única
-            notification_url: `${BASE_URL}/webhook`, // 🔑 obrigatório
+            metadata: {
+                chat_id: chatId.toString()
+            },
+            external_reference: `user_${chatId}_${Date.now()}`,
+            notification_url: `${BASE_URL}/webhook`,
             additional_info: {
                 items: [{
-                    id: `assinatura_${chatId}`,
-                    title: 'Assinatura 30 dias',
-                    description: 'Acesso completo à Calculadora Moto Pro',
-                    category_id: 'services',
+                    id: "assinatura",
+                    title: "Plano 30 dias",
                     quantity: 1,
                     unit_price: 10
                 }]
-            },
-            // Para cartão de crédito:
-            // device: { id: "<DEVICE_ID>" },
-            // issuer_id: "<ID do emissor>",
-            // statement_descriptor: "CALCULADORA MOTO PRO"
+            }
         };
 
-        const result = await mercadopago.payment.create(paymentData);
-        const paymentId = result.response?.id;
+        const result = await payment.create({ body: paymentData });
 
-        if (!paymentId) throw new Error("Pagamento não retornou ID válido");
+        const paymentId = result.id;
 
-        const { error } = await supabase.from('pagamentos').insert([{
+        await supabase.from('pagamentos').insert([{
             payment_id: paymentId,
             chat_id: chatId,
             status: "pending",
-            valor: 10,
-            mode: MP_MODE,
-            external_reference: paymentData.external_reference
+            valor: 10
         }]);
 
-        if (error) console.error("❌ ERRO SUPABASE:", error);
-        else console.log("✅ Pagamento salvo:", paymentId);
+        return result;
 
-        return result.response;
-
-    } catch (error) {
-        console.error("❌ ERRO PIX:", error);
+    } catch (err) {
+        console.error("❌ ERRO PAGAMENTO:", err);
         return null;
     }
 }
@@ -123,94 +112,100 @@ async function criarPagamento(chatId) {
 // /comprar
 bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
+
     bot.sendMessage(chatId, "⏳ Gerando PIX...");
 
     const pagamento = await criarPagamento(chatId);
-    if (!pagamento) return bot.sendMessage(chatId, "❌ Erro ao gerar pagamento.");
+
+    if (!pagamento) {
+        return bot.sendMessage(chatId, "❌ Erro ao gerar pagamento.");
+    }
 
     const pix = pagamento.point_of_interaction?.transaction_data?.qr_code;
-    if (!pix) return bot.sendMessage(chatId, "❌ Erro: PIX não gerado.");
 
-    bot.sendMessage(chatId, `💰 *PIX:*\n\`\`\`\n${pix}\n\`\`\``, { parse_mode: 'Markdown' });
+    if (!pix) {
+        return bot.sendMessage(chatId, "❌ PIX não gerado.");
+    }
+
+    // 💬 MENSAGEM EXPLICATIVA (O QUE VOCÊ PEDIU)
+    bot.sendMessage(chatId,
+        `💰 *PIX:*\n\`\`\`\n${pix}\n\`\`\`\n\n` +
+        `📲 Pague o PIX acima.\n\n` +
+        `⚡ Assim que o pagamento for aprovado,\n` +
+        `seu acesso será liberado automaticamente.`,
+        { parse_mode: "Markdown" }
+    );
 
     QRCode.toDataURL(pix, (err, url) => {
-        if (err) console.error("❌ Erro ao gerar QRCode:", err);
-        else bot.sendPhoto(chatId, url, { caption: '📲 Escaneie para pagar' });
+        if (!err) {
+            bot.sendPhoto(chatId, url, {
+                caption: "📷 Escaneie para pagar"
+            });
+        }
     });
 });
 
 // /assinatura
 bot.onText(/\/assinatura/, async (msg) => {
     const chatId = msg.chat.id;
-    const { data: usuario, error } = await supabase
+
+    const { data } = await supabase
         .from('usuarios')
         .select('*')
         .eq('chat_id', chatId)
         .single();
 
-    if (error) return bot.sendMessage(chatId, "❌ Erro ao verificar assinatura.");
-    if (!usuario || usuario.status !== "ativo") return bot.sendMessage(chatId, "❌ Sem assinatura ativa.");
+    if (!data) {
+        return bot.sendMessage(chatId, "❌ Sem assinatura ativa.");
+    }
 
-    const expires = new Date(usuario.expires_at);
-    if (isNaN(expires)) return bot.sendMessage(chatId, "❌ Data de expiração inválida.");
+    const dias = Math.ceil((new Date(data.expires_at) - new Date()) / 86400000);
 
-    const dias = Math.ceil((expires - new Date()) / (1000 * 60 * 60 * 24));
     bot.sendMessage(chatId, `✅ Ativo\nDias restantes: ${dias}`);
 });
 
-// ===== WEBHOOK PIX =====
+// ===== WEBHOOK =====
 app.post('/webhook', async (req, res) => {
     try {
-        console.log("🔥 WEBHOOK RECEBIDO:", req.body);
+        console.log("🔥 WEBHOOK:", req.body);
 
         const paymentId = req.body.data?.id;
-        if (!paymentId) return res.sendStatus(400);
+        if (!paymentId) return res.sendStatus(200);
 
-        const pagamento = await mercadopago.payment.get({ id: paymentId });
-        const status = pagamento.response?.status;
-        const chat_id = pagamento.response?.metadata?.chat_id;
+        const result = await payment.get({ id: paymentId });
 
-        console.log(`💰 Payment ID: ${paymentId}, Status: ${status}, Chat: ${chat_id}`);
+        const status = result.status;
+        const chat_id = result.metadata?.chat_id;
 
-        await supabase.from('pagamentos').update({ status }).eq('payment_id', paymentId);
+        await supabase
+            .from('pagamentos')
+            .update({ status })
+            .eq('payment_id', paymentId);
 
         if (status === "approved" && chat_id) {
+
             const novaData = new Date();
             novaData.setDate(novaData.getDate() + 30);
+
             await supabase.from('usuarios').upsert({
                 chat_id,
                 status: "ativo",
-                plano: "mensal",
                 expires_at: novaData
             });
+
             bot.sendMessage(chat_id, "✅ Pagamento aprovado! Acesso liberado 🚀");
         }
 
         res.sendStatus(200);
+
     } catch (err) {
         console.error("❌ ERRO WEBHOOK:", err);
         res.sendStatus(500);
     }
 });
 
-// ===== ADMIN =====
-app.get('/admin/usuarios', async (req, res) => {
-    if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
-    const { data, error } = await supabase.from('usuarios').select('*');
-    if (error) return res.status(500).json(error);
-    res.json(data || []);
-});
-
-app.get('/admin/faturamento', async (req, res) => {
-    if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
-    const { data, error } = await supabase.from('pagamentos').select('*').eq('status', 'approved');
-    if (error) return res.status(500).json(error);
-
-    let total = 0;
-    data.forEach(p => total += Number(p.valor));
-    res.json({ total, quantidade: data.length });
-});
-
 // ===== START =====
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Servidor rodando em ${PORT}`));
+app.listen(PORT, () => {
+    console.log("🚀 Servidor rodando");
+});
