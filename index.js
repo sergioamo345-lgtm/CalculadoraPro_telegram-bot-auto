@@ -12,7 +12,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const BASE_URL = process.env.BASE_URL;
 const ADMIN_KEY = process.env.ADMIN_KEY || '123456';
-const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || '').split(','); // IDs dos admins
+const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || '').split(','); // IDs dos admins como string
 
 if (!TELEGRAM_TOKEN || !MP_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !BASE_URL) {
     console.error("❌ ERRO: Variáveis de ambiente não configuradas");
@@ -90,14 +90,14 @@ bot.setMyCommands([
     { command: '/start', description: 'Iniciar' },
     { command: '/comprar', description: 'Comprar acesso' },
     { command: '/assinatura', description: 'Ver status' },
-    { command: '/relatorio', description: '📊 Relatório admin' }
+    { command: '/relatorio', description: 'Admin: ver usuários' }
 ]);
 
 // ===== /start =====
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     const deviceAtual = gerarDeviceId(msg);
-    const ip = msg.ip || 'desconhecido'; // se tiver IP do webhook
+    const ip = msg.ip || 'desconhecido';
 
     const { data: usuario } = await supabase
         .from('usuarios')
@@ -135,7 +135,7 @@ bot.onText(/\/start/, async (msg) => {
     bot.sendMessage(chatId, `🎁 7 dias grátis liberados!\n💰 Depois: R$10`);
 });
 
-// ===== PAGAMENTO =====
+// ===== /comprar =====
 async function criarPagamento(chatId) {
     try {
         const { data: pagamentoAberto } = await supabase
@@ -187,7 +187,6 @@ async function criarPagamento(chatId) {
     }
 }
 
-// ===== /comprar =====
 bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
 
@@ -247,13 +246,32 @@ bot.onText(/\/assinatura/, async (msg) => {
     bot.sendMessage(chatId, `✅ Ativo\nDias restantes: ${dias}`);
 });
 
-// ===== /relatorio (admin) =====
+// ===== /relatorio (ADMIN) =====
 bot.onText(/\/relatorio/, async (msg) => {
     const chatId = msg.chat.id.toString();
+
     if (!ADMIN_CHAT_IDS.includes(chatId)) {
-        return bot.sendMessage(chatId, "🚫 Você não tem permissão para acessar este comando.");
+        return bot.sendMessage(msg.chat.id, "🚫 Você não tem permissão para acessar este comando.");
     }
-    await enviarRelatorioDiario();
+
+    const { data: ativos } = await supabase.from('usuarios')
+        .select('*')
+        .eq('status', 'ativo');
+
+    const { data: pendentes } = await supabase.from('pagamentos')
+        .select('*')
+        .eq('status', 'pending');
+
+    const { data: expirados } = await supabase.from('usuarios')
+        .select('*')
+        .lt('expires_at', new Date());
+
+    let mensagem = `📊 RELATÓRIO\n\n`;
+    mensagem += `✅ Ativos: ${ativos.length}\n`;
+    mensagem += `⏳ Pagamento pendente: ${pendentes.length}\n`;
+    mensagem += `❌ Expirados: ${expirados.length}\n`;
+
+    bot.sendMessage(msg.chat.id, mensagem);
 });
 
 // ===== WEBHOOK =====
@@ -303,73 +321,6 @@ app.post('/webhook', async (req, res) => {
         res.sendStatus(500);
     }
 });
-
-// ===== RELATÓRIO DIÁRIO AUTOMÁTICO =====
-async function enviarRelatorioDiario() {
-    try {
-        const now = new Date();
-
-        // Usuários ativos
-        const { data: ativos } = await supabase
-            .from('usuarios')
-            .select('*')
-            .eq('status', 'ativo');
-
-        // Usuários expirados
-        const { data: expirados } = await supabase
-            .from('usuarios')
-            .select('*')
-            .or(`status.eq.inativo,expires_at.lt.${now.toISOString()}`);
-
-        // Pagamentos pendentes
-        const { data: pendentes } = await supabase
-            .from('pagamentos')
-            .select('*')
-            .eq('status', 'pending');
-
-        let mensagem = `📊 *Relatório Diário de Usuários*\n\n`;
-
-        // Ativos com dias restantes
-        mensagem += `✅ *Ativos*: ${ativos.length}\n`;
-        if (ativos.length > 0) {
-            const sortedAtivos = ativos.sort((a,b) => new Date(a.expires_at) - new Date(b.expires_at));
-            sortedAtivos.forEach(u => {
-                const diasRestantes = Math.ceil((new Date(u.expires_at) - now) / 86400000);
-                const alerta = diasRestantes <= 3 ? " ⚠️ quase vencendo" : "";
-                mensagem += `- ${u.chat_id} (${u.device_id || 'sem device'}) - ${diasRestantes} dias${alerta}\n`;
-            });
-        }
-
-        // Pagamentos pendentes
-        mensagem += `\n⏳ *Pagamento pendente*: ${pendentes.length}\n`;
-        if (pendentes.length > 0) {
-            pendentes.forEach(p => {
-                mensagem += `- ${p.chat_id} (R$${p.valor})\n`;
-            });
-        }
-
-        // Expirados
-        mensagem += `\n❌ *Expirados*: ${expirados.length}\n`;
-        if (expirados.length > 0) {
-            expirados.forEach(u => {
-                const diasAtraso = Math.ceil((now - new Date(u.expires_at)) / 86400000);
-                mensagem += `- ${u.chat_id} (${diasAtraso} dias atrasado)\n`;
-            });
-        }
-
-        // Envia mensagem para todos os admins
-        for (const adminId of ADMIN_CHAT_IDS) {
-            bot.sendMessage(adminId, mensagem, { parse_mode: "Markdown" });
-        }
-
-    } catch (err) {
-        console.error("❌ ERRO relatorio diário:", err);
-    }
-}
-
-// ===== Configura intervalo diário =====
-setInterval(enviarRelatorioDiario, 86400000); // 24h
-enviarRelatorioDiario(); // envia imediatamente na inicialização
 
 // ===== INICIAR SERVIDOR =====
 const PORT = process.env.PORT || 3000;
