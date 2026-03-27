@@ -15,6 +15,8 @@ if (!TELEGRAM_TOKEN || !SUPABASE_URL || !SUPABASE_KEY || !MP_ACCESS_TOKEN) {
     process.exit(1);
 }
 
+const ADMINS = [123456789]; // Coloque aqui seu chat_id
+
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -145,12 +147,88 @@ bot.onText(/\/assinatura/, async (msg) => {
         .eq('chat_id', chatId)
         .single();
 
-    if (!usuario || new Date(usuario.expires_at) < agora) {
+    if (!usuario || new Date(usuario.expires_at) < agora || usuario.status !== "ativo") {
         await logSuspeito(chatId, "ACESSO_NEGADO", "Tentativa de acessar /assinatura sem acesso válido");
         return bot.sendMessage(chatId, "🚫 Acesso inválido ou expirado.");
     }
 
     bot.sendMessage(chatId, "✅ Acesso liberado!\n📊 Relatório completo disponível!");
+});
+
+// ===== /admin =====
+// /liberar <chat_id> [meses]
+bot.onText(/\/liberar (\d+)(?: (\d+))?/, async (msg, match) => {
+    const adminId = msg.chat.id;
+    if (!ADMINS.includes(adminId)) return;
+
+    const chatId = parseInt(match[1]);
+    const meses = parseInt(match[2]) || 1;
+
+    const { data: usuario } = await supabase
+        .from('usuarios')
+        .select('*')
+        .eq('chat_id', chatId)
+        .single();
+
+    if (!usuario) return bot.sendMessage(adminId, "❌ Usuário não encontrado.");
+
+    const novaData = new Date();
+    novaData.setMonth(novaData.getMonth() + meses);
+
+    await supabase.from('usuarios')
+        .update({ status: "ativo", expires_at: novaData, tentativas_pix: 0 })
+        .eq('chat_id', chatId);
+
+    bot.sendMessage(chatId, `✅ Acesso liberado pelo admin por ${meses} mês(es)!`);
+    bot.sendMessage(adminId, `✅ Usuário ${chatId} liberado por ${meses} mês(es).`);
+});
+
+// /bloquear <chat_id>
+bot.onText(/\/bloquear (\d+)/, async (msg, match) => {
+    const adminId = msg.chat.id;
+    if (!ADMINS.includes(adminId)) return;
+
+    const chatId = parseInt(match[1]);
+
+    const { data: usuario } = await supabase
+        .from('usuarios')
+        .select('*')
+        .eq('chat_id', chatId)
+        .single();
+
+    if (!usuario) return bot.sendMessage(adminId, "❌ Usuário não encontrado.");
+
+    await supabase.from('usuarios')
+        .update({ status: "bloqueado" })
+        .eq('chat_id', chatId);
+
+    bot.sendMessage(chatId, `🚫 Seu acesso foi bloqueado pelo admin.`);
+    bot.sendMessage(adminId, `✅ Usuário ${chatId} bloqueado com sucesso.`);
+});
+
+// /status <chat_id>
+bot.onText(/\/status (\d+)/, async (msg, match) => {
+    const adminId = msg.chat.id;
+    if (!ADMINS.includes(adminId)) return;
+
+    const chatId = parseInt(match[1]);
+
+    const { data: usuario } = await supabase
+        .from('usuarios')
+        .select('*')
+        .eq('chat_id', chatId)
+        .single();
+
+    if (!usuario) return bot.sendMessage(adminId, "❌ Usuário não encontrado.");
+
+    bot.sendMessage(adminId,
+        `📊 Status do usuário ${chatId}:\n` +
+        `Status: ${usuario.status}\n` +
+        `Expira em: ${usuario.expires_at}\n` +
+        `Tentativas PIX: ${usuario.tentativas_pix}\n` +
+        `Device: ${usuario.device_id}\n` +
+        `IP: ${usuario.last_ip}`
+    );
 });
 
 // ===== Webhook Mercado Pago =====
