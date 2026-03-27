@@ -20,7 +20,11 @@ const PORT = process.env.PORT || 3000;
 // Inicializa bot e serviços
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-mercadopago.configure({ access_token: MP_ACCESS_TOKEN });
+
+// Instancia cliente Mercado Pago (novo SDK)
+const mpClient = new mercadopago.MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
+const mpPayment = new mercadopago.Payment(mpClient);
+
 const app = express();
 app.use(express.json());
 
@@ -65,14 +69,16 @@ bot.onText(/\/comprar/, async (msg) => {
       return bot.sendMessage(chatId, '❌ Limite de 3 tentativas atingido.');
     }
 
-    const payment = await mercadopago.payment.create({
-      transaction_amount: 10,
-      description: 'Assinatura CalculadoraPro',
-      payment_method_id: 'pix',
-      payer: { email: `user${chatId}@example.com` }
+    const payment = await mpPayment.create({
+      body: {
+        transaction_amount: 10,
+        description: 'Assinatura CalculadoraPro',
+        payment_method_id: 'pix',
+        payer: { email: `user${chatId}@example.com` }
+      }
     });
 
-    const pixCode = payment.body.point_of_interaction.transaction_data.qr_code;
+    const pixCode = payment.point_of_interaction.transaction_data.qr_code;
     await supabase.from('pix_attempts').insert([{ user_id: chatId, created_at: new Date() }]);
 
     bot.sendMessage(chatId, '💳 Seu PIX foi gerado:', {
@@ -154,9 +160,9 @@ app.post('/webhook', async (req, res) => {
   const data = req.body;
   try {
     if (data.type === 'payment' && data.data && data.data.id) {
-      const payment = await mercadopago.payment.findById(data.data.id);
-      if (payment.body.status === 'approved') {
-        const chatId = payment.body.payer.email.match(/user(\d+)@/)[1];
+      const payment = await mpPayment.get({ id: data.data.id });
+      if (payment.status === 'approved') {
+        const chatId = payment.payer.email.match(/user(\d+)@/)[1];
         await supabase.from('users').update({ trial_expiration: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) }).eq('id', chatId);
         bot.sendMessage(chatId, '🎉 Pagamento confirmado! Sua assinatura foi liberada por 1 mês.');
       }
