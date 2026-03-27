@@ -4,13 +4,12 @@
 // Funcionalidades: /start, /comprar, /assinatura, /admin, Webhook Mercado Pago
 // Autor: Projeto CalculadoraPro
 
-require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const mercadopago = require('mercadopago');
 
-// Variáveis de ambiente
+// Variáveis de ambiente (Render já fornece)
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -87,7 +86,7 @@ bot.onText(/\/comprar/, async (msg) => {
   }
 });
 
-// Callback para copiar PIX
+// Callback para copiar PIX e ações de admin
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const data = query.data;
@@ -97,7 +96,6 @@ bot.on('callback_query', async (query) => {
     bot.sendMessage(chatId, `📋 Copie este código PIX:\n\n${pixCode}`);
   }
 
-  // Admin callbacks
   if (ADMIN_IDS.includes(String(chatId))) {
     if (data.startsWith('BLOCK_')) {
       const userId = data.replace('BLOCK_', '');
