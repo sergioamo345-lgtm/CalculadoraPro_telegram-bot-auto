@@ -90,7 +90,7 @@ bot.setMyCommands([
     { command: '/start', description: 'Iniciar' },
     { command: '/comprar', description: 'Comprar acesso' },
     { command: '/assinatura', description: 'Ver status' },
-    { command: '/relatorio', description: 'Relatório admin' } // novo comando
+    { command: '/relatorio', description: '📊 Relatório admin' }
 ]);
 
 // ===== /start =====
@@ -247,50 +247,13 @@ bot.onText(/\/assinatura/, async (msg) => {
     bot.sendMessage(chatId, `✅ Ativo\nDias restantes: ${dias}`);
 });
 
-// ===== /relatorio (ADMIN) =====
+// ===== /relatorio (admin) =====
 bot.onText(/\/relatorio/, async (msg) => {
     const chatId = msg.chat.id.toString();
-
     if (!ADMIN_CHAT_IDS.includes(chatId)) {
         return bot.sendMessage(chatId, "🚫 Você não tem permissão para acessar este comando.");
     }
-
-    try {
-        const { data: ativos } = await supabase
-            .from('usuarios')
-            .select('chat_id, expires_at')
-            .gt('expires_at', new Date());
-
-        const { data: expirados } = await supabase
-            .from('usuarios')
-            .select('chat_id, expires_at')
-            .lte('expires_at', new Date());
-
-        const { data: pendentes } = await supabase
-            .from('pagamentos')
-            .select('chat_id, payment_id')
-            .eq('status', 'pending');
-
-        let texto = "📊 *Relatório de Usuários*\n\n";
-
-        texto += `✅ *Ativos:* ${ativos.length}\n`;
-        ativos.forEach(u => {
-            const dias = Math.ceil((new Date(u.expires_at) - new Date()) / 86400000);
-            texto += `- ${u.chat_id} → ${dias} dias restantes\n`;
-        });
-
-        texto += `\n⏳ *Pagamentos Pendentes:* ${pendentes.length}\n`;
-        pendentes.forEach(p => texto += `- ${p.chat_id} → pagamento pendente\n`);
-
-        texto += `\n❌ *Expirados:* ${expirados.length}\n`;
-        expirados.forEach(u => texto += `- ${u.chat_id}\n`);
-
-        bot.sendMessage(chatId, texto, { parse_mode: "Markdown" });
-
-    } catch (err) {
-        console.error("❌ ERRO RELATORIO:", err);
-        bot.sendMessage(chatId, "❌ Erro ao gerar relatório.");
-    }
+    await enviarRelatorioDiario();
 });
 
 // ===== WEBHOOK =====
@@ -340,6 +303,73 @@ app.post('/webhook', async (req, res) => {
         res.sendStatus(500);
     }
 });
+
+// ===== RELATÓRIO DIÁRIO AUTOMÁTICO =====
+async function enviarRelatorioDiario() {
+    try {
+        const now = new Date();
+
+        // Usuários ativos
+        const { data: ativos } = await supabase
+            .from('usuarios')
+            .select('*')
+            .eq('status', 'ativo');
+
+        // Usuários expirados
+        const { data: expirados } = await supabase
+            .from('usuarios')
+            .select('*')
+            .or(`status.eq.inativo,expires_at.lt.${now.toISOString()}`);
+
+        // Pagamentos pendentes
+        const { data: pendentes } = await supabase
+            .from('pagamentos')
+            .select('*')
+            .eq('status', 'pending');
+
+        let mensagem = `📊 *Relatório Diário de Usuários*\n\n`;
+
+        // Ativos com dias restantes
+        mensagem += `✅ *Ativos*: ${ativos.length}\n`;
+        if (ativos.length > 0) {
+            const sortedAtivos = ativos.sort((a,b) => new Date(a.expires_at) - new Date(b.expires_at));
+            sortedAtivos.forEach(u => {
+                const diasRestantes = Math.ceil((new Date(u.expires_at) - now) / 86400000);
+                const alerta = diasRestantes <= 3 ? " ⚠️ quase vencendo" : "";
+                mensagem += `- ${u.chat_id} (${u.device_id || 'sem device'}) - ${diasRestantes} dias${alerta}\n`;
+            });
+        }
+
+        // Pagamentos pendentes
+        mensagem += `\n⏳ *Pagamento pendente*: ${pendentes.length}\n`;
+        if (pendentes.length > 0) {
+            pendentes.forEach(p => {
+                mensagem += `- ${p.chat_id} (R$${p.valor})\n`;
+            });
+        }
+
+        // Expirados
+        mensagem += `\n❌ *Expirados*: ${expirados.length}\n`;
+        if (expirados.length > 0) {
+            expirados.forEach(u => {
+                const diasAtraso = Math.ceil((now - new Date(u.expires_at)) / 86400000);
+                mensagem += `- ${u.chat_id} (${diasAtraso} dias atrasado)\n`;
+            });
+        }
+
+        // Envia mensagem para todos os admins
+        for (const adminId of ADMIN_CHAT_IDS) {
+            bot.sendMessage(adminId, mensagem, { parse_mode: "Markdown" });
+        }
+
+    } catch (err) {
+        console.error("❌ ERRO relatorio diário:", err);
+    }
+}
+
+// ===== Configura intervalo diário =====
+setInterval(enviarRelatorioDiario, 86400000); // 24h
+enviarRelatorioDiario(); // envia imediatamente na inicialização
 
 // ===== INICIAR SERVIDOR =====
 const PORT = process.env.PORT || 3000;
