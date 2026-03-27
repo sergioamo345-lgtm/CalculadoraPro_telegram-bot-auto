@@ -193,4 +193,4 @@ Tentativas PIX: ${u.tentativas_pix}`;
             .select('*')
             .limit(20)
             .order('data', { ascending: false });
-        if (!logs || logs.length === 0) return bot
+        if (!logs
