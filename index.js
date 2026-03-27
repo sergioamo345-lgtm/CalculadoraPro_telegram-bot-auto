@@ -4,7 +4,7 @@ const QRCode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
 const TelegramBot = require('node-telegram-bot-api');
 
-// ✅ NOVO SDK MERCADO PAGO
+// ✅ SDK NOVO MERCADO PAGO
 const { MercadoPagoConfig, Payment } = require('mercadopago');
 
 // ===== CONFIG =====
@@ -48,6 +48,21 @@ app.post(`/telegram-webhook`, async (req, res) => {
     }
 });
 
+// ===== FUNÇÃO DE ACESSO =====
+async function verificarAcesso(chatId) {
+    const { data } = await supabase
+        .from('usuarios')
+        .select('*')
+        .eq('chat_id', chatId)
+        .single();
+
+    if (!data) return false;
+    if (data.status !== "ativo") return false;
+    if (new Date(data.expires_at) < new Date()) return false;
+
+    return true;
+}
+
 // ===== COMANDOS =====
 bot.setMyCommands([
     { command: '/start', description: 'Iniciar' },
@@ -55,13 +70,40 @@ bot.setMyCommands([
     { command: '/assinatura', description: 'Ver status' }
 ]);
 
-// /start
-bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id,
+// ===== /start COM PROTEÇÃO =====
+bot.onText(/\/start/, async (msg) => {
+    const chatId = msg.chat.id;
+
+    const { data: usuario } = await supabase
+        .from('usuarios')
+        .select('*')
+        .eq('chat_id', chatId)
+        .single();
+
+    // 👇 já usou teste
+    if (usuario && usuario.ja_usou_trial) {
+        return bot.sendMessage(chatId,
+            `👋 Bem-vindo de volta!\n\n` +
+            `❌ Você já utilizou o teste grátis.\n\n` +
+            `💰 Use /comprar para continuar`
+        );
+    }
+
+    // 👇 libera 7 dias
+    const novaData = new Date();
+    novaData.setDate(novaData.getDate() + 7);
+
+    await supabase.from('usuarios').upsert({
+        chat_id: chatId,
+        status: "ativo",
+        expires_at: novaData,
+        ja_usou_trial: true
+    });
+
+    bot.sendMessage(chatId,
         `👋 Olá ${msg.from.first_name}!\n\n` +
-        `🎁 Você tem 7 dias grátis\n\n` +
-        `💰 Depois: R$10 por 30 dias\n\n` +
-        `👉 Use /comprar`
+        `🎁 Você ganhou 7 dias grátis!\n\n` +
+        `💰 Depois: R$10 por 30 dias`
     );
 });
 
@@ -91,10 +133,9 @@ async function criarPagamento(chatId) {
         };
 
         const result = await payment.create({ body: paymentData });
-        const paymentId = result.id;
 
         await supabase.from('pagamentos').insert([{
-            payment_id: paymentId,
+            payment_id: result.id,
             chat_id: chatId,
             status: "pending",
             valor: 10
@@ -108,7 +149,7 @@ async function criarPagamento(chatId) {
     }
 }
 
-// /comprar
+// ===== /comprar =====
 bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
 
@@ -143,19 +184,23 @@ bot.onText(/\/comprar/, async (msg) => {
     });
 });
 
-// /assinatura
+// ===== /assinatura =====
 bot.onText(/\/assinatura/, async (msg) => {
     const chatId = msg.chat.id;
+
+    const acesso = await verificarAcesso(chatId);
+
+    if (!acesso) {
+        return bot.sendMessage(chatId,
+            "❌ Seu acesso expirou.\n\n💰 Use /comprar para liberar novamente."
+        );
+    }
 
     const { data } = await supabase
         .from('usuarios')
         .select('*')
         .eq('chat_id', chatId)
         .single();
-
-    if (!data) {
-        return bot.sendMessage(chatId, "❌ Sem assinatura ativa.");
-    }
 
     const dias = Math.ceil((new Date(data.expires_at) - new Date()) / 86400000);
 
@@ -167,7 +212,6 @@ app.post('/webhook', async (req, res) => {
     try {
         console.log("🔥 WEBHOOK:", req.body);
 
-        // 🔥 SUPORTE COMPLETO (formato novo + antigo)
         const paymentId = req.body.data?.id || req.body.resource;
 
         if (!paymentId) return res.sendStatus(200);
@@ -192,7 +236,8 @@ app.post('/webhook', async (req, res) => {
             await supabase.from('usuarios').upsert({
                 chat_id,
                 status: "ativo",
-                expires_at: novaData
+                expires_at: novaData,
+                ja_usou_trial: true
             });
 
             bot.sendMessage(chat_id, "✅ Pagamento aprovado! Acesso liberado 🚀");
