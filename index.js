@@ -8,7 +8,7 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY; // Service Role Key
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(',').map(Number); // IDs de admins
+const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(',').map(Number);
 const PORT = process.env.PORT || 10000;
 
 if (!TELEGRAM_TOKEN || !SUPABASE_URL || !SUPABASE_KEY || !MP_ACCESS_TOKEN) {
@@ -16,11 +16,11 @@ if (!TELEGRAM_TOKEN || !SUPABASE_URL || !SUPABASE_KEY || !MP_ACCESS_TOKEN) {
     process.exit(1);
 }
 
+// ===== INIT =====
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
 const mpPayment = new Payment(mpClient);
-
 const app = express();
 app.use(express.json());
 
@@ -56,7 +56,7 @@ bot.onText(/\/start/, async (msg) => {
     const ip = msg.ip || 'desconhecido';
     const agora = new Date();
 
-    let { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
+    const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
 
     if (usuario) {
         if (usuario.device_id && usuario.device_id !== deviceAtual) {
@@ -78,9 +78,7 @@ bot.onText(/\/start/, async (msg) => {
             );
         } else {
             await logSuspeito(chatId, "START_APÓS_TRIAL", "Tentativa de /start após expirar trial");
-            return bot.sendMessage(chatId,
-                "👋 Bem-vindo de volta!\n❌ Seu trial expirou.\n💰 Use /comprar para liberar acesso."
-            );
+            return bot.sendMessage(chatId, "👋 Bem-vindo de volta!\n❌ Seu trial expirou.\n💰 Use /comprar para liberar acesso.");
         }
     }
 
@@ -104,24 +102,8 @@ bot.onText(/\/start/, async (msg) => {
 // ===== /comprar =====
 bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
-    let { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
-
-    if (!usuario) {
-        // Cria trial se não existir (evita "Use /start antes de comprar")
-        const novaData = new Date();
-        novaData.setDate(novaData.getDate() + 7);
-        await supabase.from('usuarios').upsert({
-            chat_id: chatId,
-            status: "ativo",
-            expires_at: novaData,
-            ja_usou_trial: true,
-            device_id: gerarDeviceId(msg),
-            tentativas_pix: 0,
-            last_ip: msg.ip || 'desconhecido',
-            last_login: new Date()
-        });
-        usuario = { tentativas_pix: 0 };
-    }
+    const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
+    if (!usuario) return bot.sendMessage(chatId, "🚫 Use /start antes de comprar.");
 
     if (usuario.tentativas_pix >= 3) {
         await logSuspeito(chatId, "ERRO_PIX", "Tentativas PIX excedidas");
@@ -150,7 +132,7 @@ bot.onText(/\/comprar/, async (msg) => {
 bot.onText(/\/assinatura/, async (msg) => {
     const chatId = msg.chat.id;
     const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
-    await verificarAcesso(usuario, msg);
+    if (!(await verificarAcesso(usuario, msg))) return;
     bot.sendMessage(chatId, "✅ Acesso liberado!\n📊 Relatório completo disponível!");
 });
 
@@ -158,7 +140,6 @@ bot.onText(/\/assinatura/, async (msg) => {
 bot.onText(/\/admin/, async (msg) => {
     const chatId = msg.chat.id;
     if (!ADMIN_IDS.includes(chatId)) return;
-
     const keyboard = {
         inline_keyboard: [
             [{ text: "Ver usuários ativos", callback_data: "ADMIN_LIST_USERS" }],
@@ -168,13 +149,12 @@ bot.onText(/\/admin/, async (msg) => {
     bot.sendMessage(chatId, "⚡ Menu de Admin:", { reply_markup: keyboard });
 });
 
-// ===== CALLBACK DE ADMIN =====
+// ===== CALLBACKS ADMIN =====
 bot.on('callback_query', async (callbackQuery) => {
     const chatId = callbackQuery.from.id;
     const data = callbackQuery.data;
     if (!ADMIN_IDS.includes(chatId)) return;
 
-    // LISTAR USUÁRIOS
     if (data === "ADMIN_LIST_USERS") {
         const { data: usuarios } = await supabase.from('usuarios').select('*');
         if (!usuarios || usuarios.length === 0) return bot.sendMessage(chatId, "❌ Nenhum usuário encontrado.");
@@ -191,7 +171,6 @@ bot.on('callback_query', async (callbackQuery) => {
         }
     }
 
-    // LISTAR LOGS
     if (data === "ADMIN_LIST_LOGS") {
         const { data: logs } = await supabase.from('logs_suspeitos').select('*').order('data', { ascending: false }).limit(20);
         if (!logs || logs.length === 0) return bot.sendMessage(chatId, "❌ Nenhum log suspeito.");
@@ -200,17 +179,18 @@ bot.on('callback_query', async (callbackQuery) => {
         bot.sendMessage(chatId, text);
     }
 
-    // BLOQUEAR / LIBERAR / RESET
     if (data.startsWith("BLOCK_")) {
         const userId = data.split("_")[1];
         await supabase.from('usuarios').update({ status: "bloqueado" }).eq('chat_id', userId);
         bot.sendMessage(chatId, `🚫 Usuário ${userId} bloqueado.`);
     }
+
     if (data.startsWith("UNBLOCK_")) {
         const userId = data.split("_")[1];
         await supabase.from('usuarios').update({ status: "ativo" }).eq('chat_id', userId);
         bot.sendMessage(chatId, `✅ Usuário ${userId} liberado.`);
     }
+
     if (data.startsWith("RESET_")) {
         const userId = data.split("_")[1];
         const novaData = new Date();
@@ -228,8 +208,8 @@ app.post('/webhook', async (req, res) => {
     try {
         const result = await mpPayment.get({ id });
         const payerEmail = result.payer?.email;
-
         const { data: usuario } = await supabase.from('usuarios').select('*').eq('email', payerEmail).single();
+
         if (usuario) {
             const novaData = new Date();
             novaData.setMonth(novaData.getMonth() + 1);
