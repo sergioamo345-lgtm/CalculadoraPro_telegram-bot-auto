@@ -89,7 +89,8 @@ async function verificarAcesso(chatId, msg) {
 bot.setMyCommands([
     { command: '/start', description: 'Iniciar' },
     { command: '/comprar', description: 'Comprar acesso' },
-    { command: '/assinatura', description: 'Ver status' }
+    { command: '/assinatura', description: 'Ver status' },
+    { command: '/relatorio', description: 'Relatório admin' } // novo comando
 ]);
 
 // ===== /start =====
@@ -244,6 +245,52 @@ bot.onText(/\/assinatura/, async (msg) => {
 
     const dias = Math.ceil((new Date(data.expires_at) - new Date()) / 86400000);
     bot.sendMessage(chatId, `✅ Ativo\nDias restantes: ${dias}`);
+});
+
+// ===== /relatorio (ADMIN) =====
+bot.onText(/\/relatorio/, async (msg) => {
+    const chatId = msg.chat.id.toString();
+
+    if (!ADMIN_CHAT_IDS.includes(chatId)) {
+        return bot.sendMessage(chatId, "🚫 Você não tem permissão para acessar este comando.");
+    }
+
+    try {
+        const { data: ativos } = await supabase
+            .from('usuarios')
+            .select('chat_id, expires_at')
+            .gt('expires_at', new Date());
+
+        const { data: expirados } = await supabase
+            .from('usuarios')
+            .select('chat_id, expires_at')
+            .lte('expires_at', new Date());
+
+        const { data: pendentes } = await supabase
+            .from('pagamentos')
+            .select('chat_id, payment_id')
+            .eq('status', 'pending');
+
+        let texto = "📊 *Relatório de Usuários*\n\n";
+
+        texto += `✅ *Ativos:* ${ativos.length}\n`;
+        ativos.forEach(u => {
+            const dias = Math.ceil((new Date(u.expires_at) - new Date()) / 86400000);
+            texto += `- ${u.chat_id} → ${dias} dias restantes\n`;
+        });
+
+        texto += `\n⏳ *Pagamentos Pendentes:* ${pendentes.length}\n`;
+        pendentes.forEach(p => texto += `- ${p.chat_id} → pagamento pendente\n`);
+
+        texto += `\n❌ *Expirados:* ${expirados.length}\n`;
+        expirados.forEach(u => texto += `- ${u.chat_id}\n`);
+
+        bot.sendMessage(chatId, texto, { parse_mode: "Markdown" });
+
+    } catch (err) {
+        console.error("❌ ERRO RELATORIO:", err);
+        bot.sendMessage(chatId, "❌ Erro ao gerar relatório.");
+    }
 });
 
 // ===== WEBHOOK =====
