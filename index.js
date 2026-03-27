@@ -56,7 +56,7 @@ bot.onText(/\/start/, async (msg) => {
     const ip = msg.ip || 'desconhecido';
     const agora = new Date();
 
-    const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
+    let { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
 
     if (usuario) {
         if (usuario.device_id && usuario.device_id !== deviceAtual) {
@@ -76,9 +76,6 @@ bot.onText(/\/start/, async (msg) => {
                 `👋 Bem-vindo de volta!\n🎁 Você ainda tem *${diasRestantes} dias* de trial.\n💰 Depois: R$10`,
                 { parse_mode: "Markdown" }
             );
-        } else {
-            await logSuspeito(chatId, "START_APÓS_TRIAL", "Tentativa de /start após expirar trial");
-            return bot.sendMessage(chatId, "👋 Bem-vindo de volta!\n❌ Seu trial expirou.\n💰 Use /comprar para liberar acesso.");
         }
     }
 
@@ -102,8 +99,28 @@ bot.onText(/\/start/, async (msg) => {
 // ===== /comprar =====
 bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
-    const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
-    if (!usuario) return bot.sendMessage(chatId, "🚫 Use /start antes de comprar.");
+    let { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
+
+    // Se não existir usuário, cria automático
+    if (!usuario) {
+        const deviceAtual = gerarDeviceId(msg);
+        const agora = new Date();
+        const novaData = new Date();
+        novaData.setDate(novaData.getDate() + 7);
+        await supabase.from('usuarios').upsert({
+            chat_id: chatId,
+            status: "ativo",
+            expires_at: novaData,
+            ja_usou_trial: false,
+            device_id: deviceAtual,
+            tentativas_pix: 0,
+            last_ip: msg.ip || 'desconhecido',
+            last_login: agora
+        });
+        const { data } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
+        usuario = data;
+    }
+
     if (usuario.tentativas_pix >= 3) {
         await logSuspeito(chatId, "ERRO_PIX", "Tentativas PIX excedidas");
         return bot.sendMessage(chatId, "❌ Você já tentou gerar PIX 3 vezes. Contate o suporte.");
@@ -131,7 +148,7 @@ bot.onText(/\/comprar/, async (msg) => {
 bot.onText(/\/assinatura/, async (msg) => {
     const chatId = msg.chat.id;
     const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
-    if (!await verificarAcesso(usuario, msg)) return;
+    await verificarAcesso(usuario, msg);
     bot.sendMessage(chatId, "✅ Acesso liberado!\n📊 Relatório completo disponível!");
 });
 
@@ -139,12 +156,7 @@ bot.onText(/\/assinatura/, async (msg) => {
 bot.onText(/\/admin/, async (msg) => {
     const chatId = msg.chat.id;
     if (!ADMIN_IDS.includes(chatId)) return;
-    const keyboard = {
-        inline_keyboard: [
-            [{ text: "Ver usuários ativos", callback_data: "ADMIN_LIST_USERS" }],
-            [{ text: "Ver logs suspeitos", callback_data: "ADMIN_LIST_LOGS" }]
-        ]
-    };
+    const keyboard = { inline_keyboard: [[{ text: "Ver usuários ativos", callback_data: "ADMIN_LIST_USERS" }],[{ text: "Ver logs suspeitos", callback_data: "ADMIN_LIST_LOGS" }]] };
     bot.sendMessage(chatId, "⚡ Menu de Admin:", { reply_markup: keyboard });
 });
 
@@ -154,47 +166,37 @@ bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
     if (!ADMIN_IDS.includes(chatId)) return;
 
-    // Ver usuários
+    // Listar usuários
     if (data === "ADMIN_LIST_USERS") {
         const { data: usuarios } = await supabase.from('usuarios').select('*');
         if (!usuarios || usuarios.length === 0) return bot.sendMessage(chatId, "❌ Nenhum usuário encontrado.");
         for (const u of usuarios) {
             const text = `👤 ${u.chat_id}\nStatus: ${u.status}\nTrial: ${u.expires_at}\nPIX: ${u.tentativas_pix}`;
-            const keyboard = {
-                inline_keyboard: [
-                    [{ text: "Bloquear", callback_data: `BLOCK_${u.chat_id}` }],
-                    [{ text: "Liberar", callback_data: `UNBLOCK_${u.chat_id}` }],
-                    [{ text: "Reset Trial", callback_data: `RESET_${u.chat_id}` }]
-                ]
-            };
+            const keyboard = { inline_keyboard: [[{ text: "Bloquear", callback_data: `BLOCK_${u.chat_id}` }],[{ text: "Liberar", callback_data: `UNBLOCK_${u.chat_id}` }],[{ text: "Reset Trial", callback_data: `RESET_${u.chat_id}` }]] };
             await bot.sendMessage(chatId, text, { reply_markup: keyboard });
         }
     }
 
-    // Ver logs
+    // Listar logs
     if (data === "ADMIN_LIST_LOGS") {
-        const { data: logs } = await supabase.from('logs_suspeitos').select('*').order('data', { ascending: false }).limit(20);
+        const { data: logs } = await supabase.from('logs_suspeitos').select('*').limit(20).order('data', { ascending: false });
         if (!logs || logs.length === 0) return bot.sendMessage(chatId, "❌ Nenhum log suspeito.");
         let text = "⚠️ Últimos logs:\n";
         logs.forEach(l => text += `${l.data.toISOString()} - ${l.tipo} - ${l.descricao}\n`);
         bot.sendMessage(chatId, text);
     }
 
-    // Bloquear usuário
+    // Bloquear / Desbloquear / Reset
     if (data.startsWith("BLOCK_")) {
         const userId = data.split("_")[1];
         await supabase.from('usuarios').update({ status: "bloqueado" }).eq('chat_id', userId);
         bot.sendMessage(chatId, `🚫 Usuário ${userId} bloqueado.`);
     }
-
-    // Liberar usuário
     if (data.startsWith("UNBLOCK_")) {
         const userId = data.split("_")[1];
         await supabase.from('usuarios').update({ status: "ativo" }).eq('chat_id', userId);
         bot.sendMessage(chatId, `✅ Usuário ${userId} liberado.`);
     }
-
-    // Reset trial
     if (data.startsWith("RESET_")) {
         const userId = data.split("_")[1];
         const novaData = new Date();
