@@ -12,6 +12,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const BASE_URL = process.env.BASE_URL;
 const ADMIN_KEY = process.env.ADMIN_KEY || '123456';
+const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || '').split(','); // IDs dos admins
 
 if (!TELEGRAM_TOKEN || !MP_TOKEN || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !BASE_URL) {
     console.error("❌ ERRO: Variáveis de ambiente não configuradas");
@@ -49,6 +50,20 @@ function gerarDeviceId(msg) {
     return `${msg.from.id}_${msg.from.username || "no_user"}`;
 }
 
+// ===== REGISTRAR LOG SUSPEITO =====
+async function logSuspeito(chatId, action, info) {
+    await supabase.from('logs_suspeitos').insert([{
+        chat_id: chatId,
+        action,
+        info,
+        created_at: new Date()
+    }]);
+    // alerta admins
+    for (const adminId of ADMIN_CHAT_IDS) {
+        bot.sendMessage(adminId, `⚠️ SUSPEITA: ${action} - ${info} (chat: ${chatId})`);
+    }
+}
+
 // ===== VERIFICAR ACESSO =====
 async function verificarAcesso(chatId, msg) {
     const deviceAtual = gerarDeviceId(msg);
@@ -60,7 +75,10 @@ async function verificarAcesso(chatId, msg) {
         .single();
 
     if (!data) return false;
-    if (data.device_id && data.device_id !== deviceAtual) return false;
+    if (data.device_id && data.device_id !== deviceAtual) {
+        await logSuspeito(chatId, "DISPOSITIVO DIFERENTE", `Tentativa de acesso com device_id: ${deviceAtual}`);
+        return false;
+    }
     if (data.status !== "ativo") return false;
     if (new Date(data.expires_at) < new Date()) return false;
 
@@ -78,6 +96,7 @@ bot.setMyCommands([
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     const deviceAtual = gerarDeviceId(msg);
+    const ip = msg.ip || 'desconhecido'; // se tiver IP do webhook
 
     const { data: usuario } = await supabase
         .from('usuarios')
@@ -86,6 +105,7 @@ bot.onText(/\/start/, async (msg) => {
         .single();
 
     if (usuario && usuario.device_id && usuario.device_id !== deviceAtual) {
+        await logSuspeito(chatId, "MULTI-DEVICE", `Tentativa de start em outro device: ${deviceAtual}`);
         return bot.sendMessage(chatId,
             "🚫 Conta já está em outro dispositivo.\n\nFale com o suporte."
         );
@@ -93,7 +113,7 @@ bot.onText(/\/start/, async (msg) => {
 
     if (usuario && usuario.ja_usou_trial) {
         return bot.sendMessage(chatId,
-            `👋 Bem-vindo de volta!\n\n❌ Você já usou o teste grátis.\n\n💰 Use /comprar`
+            `👋 Bem-vindo de volta!\n❌ Você já usou o teste grátis.\n💰 Use /comprar`
         );
     }
 
@@ -105,15 +125,30 @@ bot.onText(/\/start/, async (msg) => {
         status: "ativo",
         expires_at: novaData,
         ja_usou_trial: true,
-        device_id: deviceAtual
+        device_id: deviceAtual,
+        tentativas_pix: 0,
+        last_ip: ip,
+        last_login: new Date()
     });
 
-    bot.sendMessage(chatId, `🎁 7 dias grátis liberados!\n\n💰 Depois: R$10`);
+    bot.sendMessage(chatId, `🎁 7 dias grátis liberados!\n💰 Depois: R$10`);
 });
 
 // ===== PAGAMENTO =====
 async function criarPagamento(chatId) {
     try {
+        const { data: pagamentoAberto } = await supabase
+            .from('pagamentos')
+            .select('*')
+            .eq('chat_id', chatId)
+            .eq('status', 'pending')
+            .single();
+
+        if (pagamentoAberto) {
+            await logSuspeito(chatId, "PIX REPETIDO", "Tentativa de gerar PIX enquanto outro está pendente");
+            return null;
+        }
+
         const paymentData = {
             transaction_amount: 10,
             description: "Acesso Calculadora Pro",
@@ -138,13 +173,15 @@ async function criarPagamento(chatId) {
             payment_id: result.id,
             chat_id: chatId,
             status: "pending",
-            valor: 10
+            valor: 10,
+            token: result.id + "_" + chatId
         }]);
 
         return result;
 
     } catch (err) {
         console.error("❌ PAGAMENTO:", err);
+        await logSuspeito(chatId, "ERRO_PIX", err.message);
         return null;
     }
 }
@@ -153,18 +190,34 @@ async function criarPagamento(chatId) {
 bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
 
+    const { data: usuario } = await supabase
+        .from('usuarios')
+        .select('*')
+        .eq('chat_id', chatId)
+        .single();
+
+    if (usuario && usuario.tentativas_pix >= 3) {
+        await logSuspeito(chatId, "LIMITE_PIX", "Usuário atingiu limite de tentativas");
+        return bot.sendMessage(chatId, "🚫 Limite de tentativas de PIX atingido. Fale com o suporte.");
+    }
+
     bot.sendMessage(chatId, "⏳ Gerando PIX...");
 
     const pagamento = await criarPagamento(chatId);
 
-    if (!pagamento) return bot.sendMessage(chatId, "❌ Erro.");
+    if (!pagamento) {
+        await supabase.from('usuarios')
+            .update({ tentativas_pix: (usuario?.tentativas_pix || 0) + 1 })
+            .eq('chat_id', chatId);
+        return bot.sendMessage(chatId, "❌ Já existe PIX pendente ou erro ao gerar.");
+    }
 
     const pix = pagamento.point_of_interaction?.transaction_data?.qr_code;
 
     if (!pix) return bot.sendMessage(chatId, "❌ PIX erro.");
 
     bot.sendMessage(chatId,
-        `💰 *PIX:*\n\`\`\`\n${pix}\n\`\`\`\n\n📲 Pague o PIX\n\n⚡ Liberação automática após pagamento.`,
+        `💰 *PIX:*\n\`\`\`\n${pix}\n\`\`\`\n📲 Pague o PIX\n⚡ Liberação automática após pagamento.`,
         { parse_mode: "Markdown" }
     );
 
@@ -176,10 +229,10 @@ bot.onText(/\/comprar/, async (msg) => {
 // ===== /assinatura =====
 bot.onText(/\/assinatura/, async (msg) => {
     const chatId = msg.chat.id;
-
     const acesso = await verificarAcesso(chatId, msg);
 
     if (!acesso) {
+        await logSuspeito(chatId, "ACESSO_NEGADO", "Tentativa de acessar /assinatura sem acesso válido");
         return bot.sendMessage(chatId, "🚫 Acesso inválido ou expirado.");
     }
 
@@ -190,22 +243,28 @@ bot.onText(/\/assinatura/, async (msg) => {
         .single();
 
     const dias = Math.ceil((new Date(data.expires_at) - new Date()) / 86400000);
-
-    bot.sendMessage(chatId, `✅ Ativo\nDias: ${dias}`);
+    bot.sendMessage(chatId, `✅ Ativo\nDias restantes: ${dias}`);
 });
 
 // ===== WEBHOOK =====
 app.post('/webhook', async (req, res) => {
     try {
-        console.log("🔥 WEBHOOK:", req.body);
-
         const paymentId = req.body.data?.id || req.body.resource;
         if (!paymentId) return res.sendStatus(200);
 
         const result = await payment.get({ id: paymentId });
-
         const status = result.status;
         const chat_id = result.metadata?.chat_id;
+
+        const { data: pagamentoAtual } = await supabase
+            .from('pagamentos')
+            .select('*')
+            .eq('payment_id', paymentId)
+            .single();
+
+        if (!pagamentoAtual || pagamentoAtual.status === status) {
+            return res.sendStatus(200);
+        }
 
         await supabase
             .from('pagamentos')
@@ -213,6 +272,30 @@ app.post('/webhook', async (req, res) => {
             .eq('payment_id', paymentId);
 
         if (status === "approved" && chat_id) {
-
             const novaData = new Date();
-            novaData
+            novaData.setDate(novaData.getDate() + 30);
+
+            await supabase.from('usuarios')
+                .update({
+                    status: "ativo",
+                    expires_at: novaData,
+                    tentativas_pix: 0
+                })
+                .eq('chat_id', chat_id);
+
+            bot.sendMessage(chat_id, `✅ Pagamento aprovado!\nAcesso liberado por 30 dias.`);
+        }
+
+        res.sendStatus(200);
+
+    } catch (err) {
+        console.error("❌ WEBHOOK:", err);
+        res.sendStatus(500);
+    }
+});
+
+// ===== INICIAR SERVIDOR =====
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`🚀 Servidor rodando na porta ${PORT}`);
+});
