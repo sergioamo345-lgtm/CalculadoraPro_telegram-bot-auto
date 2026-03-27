@@ -8,216 +8,337 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY; // Service Role Key
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(',').map(Number);
+const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(',').filter(Boolean).map(Number); // IDs de admins
 const PORT = process.env.PORT || 10000;
 
 if (!TELEGRAM_TOKEN || !SUPABASE_URL || !SUPABASE_KEY || !MP_ACCESS_TOKEN) {
-    console.error("❌ Variáveis de ambiente não configuradas");
-    process.exit(1);
+  console.error("❌ ERRO: Variáveis de ambiente não configuradas");
+  process.exit(1);
 }
 
-// ===== INIT =====
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const mpClient = new MercadoPagoConfig({ accessToken: MP_ACCESS_TOKEN });
 const mpPayment = new Payment(mpClient);
+
 const app = express();
 app.use(express.json());
 
 // ===== FUNÇÕES AUXILIARES =====
 function gerarDeviceId(msg) {
-    return `${msg.chat.id}-${msg.from.username || 'anon'}`;
+  return `${msg.chat.id}-${msg.from?.username || 'anon'}`;
 }
 
-async function logSuspeito(chatId, tipo, descricao) {
-    console.log(`⚠️ SUSPEITA: ${tipo} - ${descricao} (chat: ${chatId})`);
-    await supabase.from('logs_suspeitos').insert([{ chat_id: chatId, tipo, descricao, data: new Date() }]);
+async function logSuspeito(chatId, tipo, descricao, extra = {}) {
+  console.log(`⚠️ SUSPEITA: ${tipo} - ${descricao} (chat: ${chatId})`, extra);
+  try {
+    await supabase.from('logs_suspeitos').insert([{
+      chat_id: chatId,
+      tipo,
+      descricao,
+      data: new Date(),
+      ip: extra.ip || null,
+      device_id: extra.device_id || null
+    }]);
+  } catch (err) {
+    console.error("Erro ao gravar log_suspeitos:", err);
+  }
 }
 
-async function verificarAcesso(usuario, chatId) {
-    const agora = new Date();
-    if (!usuario || new Date(usuario.expires_at) < agora) {
-        await logSuspeito(chatId, "ACESSO_NEGADO", "Tentativa de acessar comando sem acesso válido");
-        bot.sendMessage(chatId, "🚫 Acesso inválido ou expirado.");
-        return false;
-    }
-    if (usuario.status === "bloqueado") {
-        await logSuspeito(chatId, "ACESSO_NEGADO", "Usuário bloqueado tentou acessar comando");
-        bot.sendMessage(chatId, "🚫 Sua conta está bloqueada. Contate o suporte.");
-        return false;
-    }
-    return true;
+async function verificarAcesso(usuario, msg) {
+  const agora = new Date();
+  if (!usuario) {
+    await logSuspeito(msg.chat.id, "ACESSO_NEGADO", "Usuário não encontrado ao verificar acesso");
+    // não enviar mensagem aqui para evitar duplicidade; quem chama decide
+    return false;
+  }
+  if (usuario.status === "bloqueado") {
+    await logSuspeito(msg.chat.id, "ACESSO_NEGADO", "Usuário bloqueado tentou acessar comando");
+    return false;
+  }
+  if (usuario.expires_at && new Date(usuario.expires_at) < agora) {
+    await logSuspeito(msg.chat.id, "ACESSO_NEGADO", "Trial/assinatura expirada");
+    return false;
+  }
+  return true;
 }
 
 // ===== /start =====
 bot.onText(/\/start/, async (msg) => {
+  try {
     const chatId = msg.chat.id;
     const deviceAtual = gerarDeviceId(msg);
+    const ip = msg.ip || 'desconhecido';
     const agora = new Date();
 
-    let { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
-
-    if (!usuario) {
-        const novaData = new Date();
-        novaData.setDate(novaData.getDate() + 7);
-
-        await supabase.from('usuarios').insert({
-            chat_id: chatId,
-            status: "ativo",
-            expires_at: novaData,
-            ja_usou_trial: true,
-            device_id: deviceAtual,
-            tentativas_pix: 0,
-            last_ip: msg.ip || 'desconhecido',
-            last_login: agora
-        });
-
-        return bot.sendMessage(chatId, "🎁 7 dias grátis liberados!\n💰 Depois: R$10");
+    const { data: usuario, error } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
+    if (error && error.code !== 'PGRST116') {
+      console.error("Erro ao buscar usuario:", error);
     }
 
-    // Anti-burlar multi-device / multi-IP
-    if (usuario.device_id && usuario.device_id !== deviceAtual) {
-        await logSuspeito(chatId, "MULTI-DEVICE", `Tentativa de start em outro device: ${deviceAtual}`);
-        return bot.sendMessage(chatId, "🚫 Conta já está em outro dispositivo.\nFale com o suporte.");
+    if (usuario) {
+      if (usuario.device_id && usuario.device_id !== deviceAtual) {
+        await logSuspeito(chatId, "MULTI-DEVICE", `Tentativa de start em outro device: ${deviceAtual}`, { ip, device_id: deviceAtual });
+        return bot.sendMessage(chatId, "🚫 Conta já está em outro dispositivo. Fale com o suporte.");
+      }
+      if (usuario.last_ip && usuario.last_ip !== ip) {
+        await logSuspeito(chatId, "MULTI-IP", `Tentativa de start de outro IP: ${ip}`, { ip, device_id: deviceAtual });
+        return bot.sendMessage(chatId, "🚫 Tentativa de acesso de outro IP detectada. Fale com o suporte.");
+      }
     }
 
-    const diasRestantes = Math.ceil((new Date(usuario.expires_at) - agora) / 86400000);
-    if (diasRestantes > 0) {
+    if (usuario && usuario.ja_usou_trial) {
+      const diasRestantes = Math.ceil((new Date(usuario.expires_at) - agora) / 86400000);
+      if (diasRestantes > 0) {
         return bot.sendMessage(chatId,
-            `👋 Bem-vindo de volta!\n🎁 Você ainda tem *${diasRestantes} dias* de acesso.\n💰 Depois: R$10`,
-            { parse_mode: "Markdown" }
+          `👋 Bem-vindo de volta!\n🎁 Você ainda tem *${diasRestantes} dias* de trial.\n💰 Depois: R$10`,
+          { parse_mode: "Markdown" }
         );
-    } else {
-        await logSuspeito(chatId, "START_APÓS_TRIAL", "Tentativa de /start após expirar trial");
-        return bot.sendMessage(chatId, "❌ Seu trial expirou.\n💰 Use /comprar para liberar acesso.");
+      } else {
+        await logSuspeito(chatId, "START_APÓS_TRIAL", "Tentativa de /start após expirar trial", { ip, device_id: deviceAtual });
+        return bot.sendMessage(chatId, "👋 Bem-vindo de volta!\n❌ Seu trial expirou.\n💰 Use /comprar para liberar acesso.");
+      }
     }
+
+    const novaData = new Date();
+    novaData.setDate(novaData.getDate() + 7);
+
+    await supabase.from('usuarios').upsert({
+      chat_id: chatId,
+      status: "ativo",
+      expires_at: novaData,
+      ja_usou_trial: true,
+      device_id: deviceAtual,
+      tentativas_pix: 0,
+      last_ip: ip,
+      last_login: agora
+    });
+
+    return bot.sendMessage(chatId, "🎁 7 dias grátis liberados!\n💰 Depois: R$10");
+  } catch (err) {
+    console.error("/start error:", err);
+  }
 });
 
 // ===== /comprar =====
 bot.onText(/\/comprar/, async (msg) => {
+  try {
     const chatId = msg.chat.id;
-    const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
-    if (!usuario) return bot.sendMessage(chatId, "🚫 Por favor, use /start antes de comprar."); // só primeira vez
+    let { data: usuario, error } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
 
-    if (usuario.tentativas_pix >= 3) {
-        await logSuspeito(chatId, "ERRO_PIX", "Tentativas PIX excedidas");
-        return bot.sendMessage(chatId, "❌ Você já tentou gerar PIX 3 vezes. Contate o suporte.");
+    if (error && error.code !== 'PGRST116') {
+      console.error("Erro ao buscar usuario:", error);
     }
 
-    await supabase.from('usuarios').update({ tentativas_pix: usuario.tentativas_pix + 1 }).eq('chat_id', chatId);
+    // Se não existir, cria registro básico
+    if (!usuario) {
+      usuario = { chat_id: chatId, tentativas_pix: 0 };
+      await supabase.from('usuarios').insert([{
+        chat_id: chatId,
+        status: "pendente_pagamento",
+        expires_at: new Date(),
+        ja_usou_trial: true,
+        tentativas_pix: 0
+      }]);
+    }
+
+    if ((usuario.tentativas_pix || 0) >= 3) {
+      await logSuspeito(chatId, "ERRO_PIX", "Tentativas PIX excedidas");
+      return bot.sendMessage(chatId, "❌ Você já tentou gerar PIX 3 vezes. Contate o suporte.");
+    }
+
+    await supabase.from('usuarios').update({ tentativas_pix: (usuario.tentativas_pix || 0) + 1 }).eq('chat_id', chatId);
 
     try {
-        const paymentData = {
-            transaction_amount: 10,
-            description: "Assinatura Calculadora Pro",
-            payment_method_id: "pix",
-            payer: { email: `${msg.from.username || 'anon'}@example.com` }
-        };
-        const result = await mpPayment.create({ body: paymentData });
-        bot.sendMessage(chatId, `💰 PIX gerado:\n${result.point_of_interaction.transaction_data.qr_code}\n📲 Pague e liberação automática.`);
+      const paymentData = {
+        transaction_amount: 10,
+        description: "Assinatura Calculadora Pro",
+        payment_method_id: "pix",
+        payer: { email: `${msg.from?.username || 'anon'}@example.com` },
+        metadata: { chat_id: chatId.toString() }
+      };
+      const result = await mpPayment.create({ body: paymentData });
+      const qr = result?.point_of_interaction?.transaction_data?.qr_code || result?.body?.point_of_interaction?.transaction_data?.qr_code;
+      if (!qr) {
+        console.warn("Resposta MP sem QR:", result);
+        return bot.sendMessage(chatId, "🚫 Não foi possível gerar o PIX. Tente novamente mais tarde.");
+      }
+      return bot.sendMessage(chatId, `💰 PIX:\n${qr}\n📲 Pague e liberação automática.`);
     } catch (err) {
-        console.log("❌ PAGAMENTO:", err);
-        await logSuspeito(chatId, "ERRO_PIX", err.message);
-        bot.sendMessage(chatId, "🚫 Erro ao gerar PIX. Tente novamente.");
+      console.log("❌ PAGAMENTO:", err);
+      await logSuspeito(chatId, "ERRO_PIX", err.message || String(err));
+      return bot.sendMessage(chatId, "🚫 Erro ao gerar PIX. Tente novamente.");
     }
+  } catch (err) {
+    console.error("/comprar error:", err);
+  }
 });
 
 // ===== /assinatura =====
 bot.onText(/\/assinatura/, async (msg) => {
+  try {
     const chatId = msg.chat.id;
     const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
-    if (!(await verificarAcesso(usuario, chatId))) return;
-
-    bot.sendMessage(chatId, "✅ Acesso liberado!\n📊 Relatório completo disponível!");
+    const ok = await verificarAcesso(usuario, msg);
+    if (!ok) {
+      // enviar mensagem única e clara quando não tem acesso
+      return bot.sendMessage(chatId, "🚫 Acesso inválido ou expirado. Use /comprar para renovar.");
+    }
+    return bot.sendMessage(chatId, "✅ Acesso liberado!\n📊 Relatório completo disponível!");
+  } catch (err) {
+    console.error("/assinatura error:", err);
+  }
 });
 
 // ===== /admin =====
 bot.onText(/\/admin/, async (msg) => {
+  try {
     const chatId = msg.chat.id;
     if (!ADMIN_IDS.includes(chatId)) return;
     const keyboard = {
-        inline_keyboard: [
-            [{ text: "Ver usuários ativos", callback_data: "ADMIN_LIST_USERS" }],
-            [{ text: "Ver logs suspeitos", callback_data: "ADMIN_LIST_LOGS" }]
-        ]
+      inline_keyboard: [
+        [{ text: "👥 Ver usuários", callback_data: "ADMIN_LIST_USERS" }],
+        [{ text: "⚠️ Ver logs suspeitos", callback_data: "ADMIN_LIST_LOGS" }]
+      ]
     };
-    bot.sendMessage(chatId, "⚡ Menu de Admin:", { reply_markup: keyboard });
+    return bot.sendMessage(chatId, "⚡ Menu de Admin:", { reply_markup: keyboard });
+  } catch (err) {
+    console.error("/admin error:", err);
+  }
 });
 
-// ===== CALLBACKS ADMIN =====
+// ===== CALLBACKS DE ADMIN =====
 bot.on('callback_query', async (callbackQuery) => {
-    const chatId = callbackQuery.from.id;
-    const data = callbackQuery.data;
-    if (!ADMIN_IDS.includes(chatId)) return;
+  const fromId = callbackQuery.from.id;
+  const data = callbackQuery.data;
+  const messageId = callbackQuery.message?.message_id;
+  try {
+    if (!ADMIN_IDS.includes(fromId)) {
+      await bot.answerCallbackQuery(callbackQuery.id, { text: "Acesso negado." });
+      return;
+    }
 
+    // LIST USERS
     if (data === "ADMIN_LIST_USERS") {
-        const { data: usuarios } = await supabase.from('usuarios').select('*');
-        if (!usuarios || usuarios.length === 0) return bot.sendMessage(chatId, "❌ Nenhum usuário encontrado.");
-        for (const u of usuarios) {
-            const text = `👤 ${u.chat_id}\nStatus: ${u.status}\nTrial: ${u.expires_at}\nPIX: ${u.tentativas_pix}`;
-            const keyboard = {
-                inline_keyboard: [
-                    [{ text: "Bloquear", callback_data: `BLOCK_${u.chat_id}` }],
-                    [{ text: "Liberar", callback_data: `UNBLOCK_${u.chat_id}` }],
-                    [{ text: "Reset Trial", callback_data: `RESET_${u.chat_id}` }]
-                ]
-            };
-            await bot.sendMessage(chatId, text, { reply_markup: keyboard });
-        }
+      const { data: usuarios } = await supabase.from('usuarios').select('*').order('chat_id', { ascending: true });
+      if (!usuarios || usuarios.length === 0) {
+        await bot.answerCallbackQuery(callbackQuery.id, { text: "Nenhum usuário encontrado." });
+        return;
+      }
+      await bot.answerCallbackQuery(callbackQuery.id);
+      for (const u of usuarios) {
+        const text = `👤 Usuário: ${u.chat_id}\nStatus: ${u.status}\nExpira: ${u.expires_at}\nTentativas PIX: ${u.tentativas_pix || 0}`;
+        const keyboard = {
+          inline_keyboard: [
+            [
+              { text: "🚫 Bloquear", callback_data: `BLOCK_${u.chat_id}` },
+              { text: "✅ Liberar", callback_data: `UNBLOCK_${u.chat_id}` }
+            ],
+            [{ text: "🔄 Reset Trial", callback_data: `RESET_${u.chat_id}` }]
+          ]
+        };
+        await bot.sendMessage(fromId, text, { reply_markup: keyboard });
+      }
+      return;
     }
 
+    // LIST LOGS
     if (data === "ADMIN_LIST_LOGS") {
-        const { data: logs } = await supabase.from('logs_suspeitos').select('*').order('data', { ascending: false }).limit(20);
-        if (!logs || logs.length === 0) return bot.sendMessage(chatId, "❌ Nenhum log suspeito.");
-        let text = "⚠️ Últimos logs:\n";
-        logs.forEach(l => text += `${l.data.toISOString()} - ${l.tipo} - ${l.descricao}\n`);
-        bot.sendMessage(chatId, text);
+      const { data: logs } = await supabase.from('logs_suspeitos').select('*').limit(50).order('data', { ascending: false });
+      if (!logs || logs.length === 0) {
+        await bot.answerCallbackQuery(callbackQuery.id, { text: "Nenhum log suspeito." });
+        return;
+      }
+      let text = "⚠️ Últimos logs:\n";
+      logs.forEach(l => {
+        text += `${new Date(l.data).toLocaleString()} - ${l.tipo} - ${l.descricao}\n`;
+      });
+      await bot.answerCallbackQuery(callbackQuery.id);
+      return bot.sendMessage(fromId, text);
     }
 
+    // BLOCK / UNBLOCK / RESET via callbacks
     if (data.startsWith("BLOCK_")) {
-        const userId = data.split("_")[1];
-        await supabase.from('usuarios').update({ status: "bloqueado" }).eq('chat_id', userId);
-        bot.sendMessage(chatId, `🚫 Usuário ${userId} bloqueado.`);
+      const userId = data.split("_")[1];
+      await supabase.from('usuarios').update({ status: "bloqueado" }).eq('chat_id', userId);
+      await supabase.from('admin_logs').insert([{ admin_id: fromId, acao: 'bloquear', alvo_chat_id: userId }]).catch(() => {});
+      await bot.answerCallbackQuery(callbackQuery.id, { text: `Usuário ${userId} bloqueado.` });
+      return bot.sendMessage(fromId, `🚫 Usuário ${userId} bloqueado manualmente.`);
     }
 
     if (data.startsWith("UNBLOCK_")) {
-        const userId = data.split("_")[1];
-        await supabase.from('usuarios').update({ status: "ativo" }).eq('chat_id', userId);
-        bot.sendMessage(chatId, `✅ Usuário ${userId} liberado.`);
+      const userId = data.split("_")[1];
+      await supabase.from('usuarios').update({ status: "ativo" }).eq('chat_id', userId);
+      await supabase.from('admin_logs').insert([{ admin_id: fromId, acao: 'liberar', alvo_chat_id: userId }]).catch(() => {});
+      await bot.answerCallbackQuery(callbackQuery.id, { text: `Usuário ${userId} liberado.` });
+      return bot.sendMessage(fromId, `✅ Usuário ${userId} liberado manualmente.`);
     }
 
     if (data.startsWith("RESET_")) {
-        const userId = data.split("_")[1];
-        const novaData = new Date();
-        novaData.setDate(novaData.getDate() + 7);
-        await supabase.from('usuarios').update({ expires_at: novaData, ja_usou_trial: true }).eq('chat_id', userId);
-        bot.sendMessage(chatId, `🔄 Trial do usuário ${userId} resetado por 7 dias.`);
+      const userId = data.split("_")[1];
+      const novaData = new Date();
+      novaData.setDate(novaData.getDate() + 7);
+      await supabase.from('usuarios').update({ expires_at: novaData, ja_usou_trial: true }).eq('chat_id', userId);
+      await supabase.from('admin_logs').insert([{ admin_id: fromId, acao: 'reset_trial', alvo_chat_id: userId }]).catch(() => {});
+      await bot.answerCallbackQuery(callbackQuery.id, { text: `Trial do usuário ${userId} resetado.` });
+      return bot.sendMessage(fromId, `🔄 Trial do usuário ${userId} resetado por 7 dias.`);
     }
+
+    // fallback
+    await bot.answerCallbackQuery(callbackQuery.id);
+  } catch (err) {
+    console.error("callback_query error:", err);
+    try { await bot.answerCallbackQuery(callbackQuery.id, { text: "Erro interno." }); } catch (e) {}
+  }
 });
 
-// ===== WEBHOOK MERCADO PAGO =====
+// ===== Webhook Mercado Pago =====
 app.post('/webhook', async (req, res) => {
-    const { id, type } = req.body;
+  try {
+    const { id, type } = req.body || {};
+    console.log("Webhook recebido:", req.body);
     if (type !== 'payment') return res.sendStatus(200);
 
-    try {
-        const result = await mpPayment.get({ id });
-        const payerEmail = result.payer?.email;
-        const { data: usuario } = await supabase.from('usuarios').select('*').eq('email', payerEmail).single();
+    const result = await mpPayment.get({ id });
+    // resultado pode vir em result.body ou result diretamente dependendo da lib/versão
+    const metadata = result?.metadata || result?.body?.metadata || {};
+    const chatId = metadata?.chat_id;
+    const status = result?.status || result?.body?.status;
 
-        if (usuario) {
-            const novaData = new Date();
-            novaData.setMonth(novaData.getMonth() + 1);
-            await supabase.from('usuarios').update({ status: "ativo", expires_at: novaData, tentativas_pix: 0 }).eq('chat_id', usuario.chat_id);
-            bot.sendMessage(usuario.chat_id, "✅ Pagamento confirmado! Acesso liberado por 1 mês.");
-        }
-
-        res.sendStatus(200);
-    } catch (err) {
-        console.log("❌ WEBHOOK ERROR:", err);
-        res.sendStatus(500);
+    if (chatId) {
+      // marca pagamento e libera acesso
+      const novaData = new Date();
+      novaData.setMonth(novaData.getMonth() + 1);
+      await supabase.from('usuarios').update({ status: "ativo", expires_at: novaData, tentativas_pix: 0 }).eq('chat_id', chatId);
+      await supabase.from('pagamentos').insert([{
+        payment_id: id,
+        chat_id: chatId,
+        status: status || 'approved',
+        valor: result?.transaction_amount || result?.body?.transaction_amount || 10
+      }]).catch(() => {});
+      try {
+        await bot.sendMessage(Number(chatId), "✅ Pagamento confirmado! Acesso liberado por 1 mês.");
+      } catch (err) {
+        console.warn("Não foi possível enviar mensagem ao usuário (talvez chat_id inválido):", chatId, err);
+      }
+    } else {
+      console.warn("Webhook sem metadata.chat_id:", result);
     }
+
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error("WEBHOOK ERROR:", err);
+    return res.sendStatus(500);
+  }
 });
 
-// ===== START EXPRESS =====
+// ===== Start Express =====
 app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+
+// ===== Tratamento básico de erros não capturados =====
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
