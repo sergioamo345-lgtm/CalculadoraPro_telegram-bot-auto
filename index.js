@@ -6,13 +6,13 @@ const { MercadoPagoConfig, Payment } = require('mercadopago');
 // ===== CONFIG =====
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY; // Service Role Key
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(',').map(Number); // IDs de admins
+const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(',').map(Number);
 const PORT = process.env.PORT || 10000;
 
 if (!TELEGRAM_TOKEN || !SUPABASE_URL || !SUPABASE_KEY || !MP_ACCESS_TOKEN) {
-    console.error("❌ ERRO: Variáveis de ambiente não configuradas");
+    console.error("❌ Variáveis de ambiente não configuradas");
     process.exit(1);
 }
 
@@ -53,23 +53,11 @@ async function verificarAcesso(usuario, msg) {
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     const deviceAtual = gerarDeviceId(msg);
-    const ip = msg.ip || 'desconhecido';
     const agora = new Date();
 
-    let { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
+    const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
 
     if (usuario) {
-        if (usuario.device_id && usuario.device_id !== deviceAtual) {
-            await logSuspeito(chatId, "MULTI-DEVICE", `Tentativa de start em outro device: ${deviceAtual}`);
-            return bot.sendMessage(chatId, "🚫 Conta já está em outro dispositivo.\nFale com o suporte.");
-        }
-        if (usuario.last_ip && usuario.last_ip !== ip) {
-            await logSuspeito(chatId, "MULTI-IP", `Tentativa de start de outro IP: ${ip}`);
-            return bot.sendMessage(chatId, "🚫 Tentativa de acesso de outro IP detectada.\nFale com o suporte.");
-        }
-    }
-
-    if (usuario && usuario.ja_usou_trial) {
         const diasRestantes = Math.ceil((new Date(usuario.expires_at) - agora) / 86400000);
         if (diasRestantes > 0) {
             return bot.sendMessage(chatId,
@@ -89,7 +77,6 @@ bot.onText(/\/start/, async (msg) => {
         ja_usou_trial: true,
         device_id: deviceAtual,
         tentativas_pix: 0,
-        last_ip: ip,
         last_login: agora
     });
 
@@ -101,24 +88,19 @@ bot.onText(/\/comprar/, async (msg) => {
     const chatId = msg.chat.id;
     let { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
 
-    // Se não existir usuário, cria automático
+    // Cria usuário automático se não existir
     if (!usuario) {
-        const deviceAtual = gerarDeviceId(msg);
-        const agora = new Date();
         const novaData = new Date();
         novaData.setDate(novaData.getDate() + 7);
-        await supabase.from('usuarios').upsert({
+        await supabase.from('usuarios').insert({
             chat_id: chatId,
             status: "ativo",
             expires_at: novaData,
-            ja_usou_trial: false,
-            device_id: deviceAtual,
+            ja_usou_trial: true,
             tentativas_pix: 0,
-            last_ip: msg.ip || 'desconhecido',
-            last_login: agora
+            last_login: new Date()
         });
-        const { data } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
-        usuario = data;
+        usuario = { chat_id: chatId, tentativas_pix: 0 };
     }
 
     if (usuario.tentativas_pix >= 3) {
@@ -147,8 +129,24 @@ bot.onText(/\/comprar/, async (msg) => {
 // ===== /assinatura =====
 bot.onText(/\/assinatura/, async (msg) => {
     const chatId = msg.chat.id;
-    const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
-    await verificarAcesso(usuario, msg);
+    let { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
+
+    // Cria usuário automático se não existir
+    if (!usuario) {
+        const novaData = new Date();
+        novaData.setDate(novaData.getDate() + 7);
+        await supabase.from('usuarios').insert({
+            chat_id: chatId,
+            status: "ativo",
+            expires_at: novaData,
+            ja_usou_trial: true,
+            tentativas_pix: 0,
+            last_login: new Date()
+        });
+        usuario = { chat_id: chatId, status: "ativo", expires_at: novaData };
+    }
+
+    if (!await verificarAcesso(usuario, msg)) return;
     bot.sendMessage(chatId, "✅ Acesso liberado!\n📊 Relatório completo disponível!");
 });
 
@@ -166,7 +164,6 @@ bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
     if (!ADMIN_IDS.includes(chatId)) return;
 
-    // Listar usuários
     if (data === "ADMIN_LIST_USERS") {
         const { data: usuarios } = await supabase.from('usuarios').select('*');
         if (!usuarios || usuarios.length === 0) return bot.sendMessage(chatId, "❌ Nenhum usuário encontrado.");
@@ -177,7 +174,6 @@ bot.on('callback_query', async (callbackQuery) => {
         }
     }
 
-    // Listar logs
     if (data === "ADMIN_LIST_LOGS") {
         const { data: logs } = await supabase.from('logs_suspeitos').select('*').limit(20).order('data', { ascending: false });
         if (!logs || logs.length === 0) return bot.sendMessage(chatId, "❌ Nenhum log suspeito.");
@@ -186,17 +182,18 @@ bot.on('callback_query', async (callbackQuery) => {
         bot.sendMessage(chatId, text);
     }
 
-    // Bloquear / Desbloquear / Reset
     if (data.startsWith("BLOCK_")) {
         const userId = data.split("_")[1];
         await supabase.from('usuarios').update({ status: "bloqueado" }).eq('chat_id', userId);
         bot.sendMessage(chatId, `🚫 Usuário ${userId} bloqueado.`);
     }
+
     if (data.startsWith("UNBLOCK_")) {
         const userId = data.split("_")[1];
         await supabase.from('usuarios').update({ status: "ativo" }).eq('chat_id', userId);
         bot.sendMessage(chatId, `✅ Usuário ${userId} liberado.`);
     }
+
     if (data.startsWith("RESET_")) {
         const userId = data.split("_")[1];
         const novaData = new Date();
