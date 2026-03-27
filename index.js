@@ -49,7 +49,6 @@ async function verificarAcesso(usuario, msg) {
   const agora = new Date();
   if (!usuario) {
     await logSuspeito(msg.chat.id, "ACESSO_NEGADO", "Usuário não encontrado ao verificar acesso");
-    // não enviar mensagem aqui para evitar duplicidade; quem chama decide
     return false;
   }
   if (usuario.status === "bloqueado") {
@@ -163,7 +162,17 @@ bot.onText(/\/comprar/, async (msg) => {
         console.warn("Resposta MP sem QR:", result);
         return bot.sendMessage(chatId, "🚫 Não foi possível gerar o PIX. Tente novamente mais tarde.");
       }
-      return bot.sendMessage(chatId, `💰 PIX:\n${qr}\n📲 Pague e liberação automática.`);
+
+      // === BOTÃO DE COPIAR PIX ===
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: "📋 Copiar PIX", url: `https://t.me/share/url?url=${encodeURIComponent(qr)}&text=PIX` }
+          ]
+        ]
+      };
+
+      return bot.sendMessage(chatId, `💰 PIX:\n${qr}\n📲 Pague e liberação automática.`, { reply_markup: keyboard });
     } catch (err) {
       console.log("❌ PAGAMENTO:", err);
       await logSuspeito(chatId, "ERRO_PIX", err.message || String(err));
@@ -181,7 +190,6 @@ bot.onText(/\/assinatura/, async (msg) => {
     const { data: usuario } = await supabase.from('usuarios').select('*').eq('chat_id', chatId).single();
     const ok = await verificarAcesso(usuario, msg);
     if (!ok) {
-      // enviar mensagem única e clara quando não tem acesso
       return bot.sendMessage(chatId, "🚫 Acesso inválido ou expirado. Use /comprar para renovar.");
     }
     return bot.sendMessage(chatId, "✅ Acesso liberado!\n📊 Relatório completo disponível!");
@@ -263,82 +271,4 @@ bot.on('callback_query', async (callbackQuery) => {
       await supabase.from('usuarios').update({ status: "bloqueado" }).eq('chat_id', userId);
       await supabase.from('admin_logs').insert([{ admin_id: fromId, acao: 'bloquear', alvo_chat_id: userId }]).catch(() => {});
       await bot.answerCallbackQuery(callbackQuery.id, { text: `Usuário ${userId} bloqueado.` });
-      return bot.sendMessage(fromId, `🚫 Usuário ${userId} bloqueado manualmente.`);
-    }
-
-    if (data.startsWith("UNBLOCK_")) {
-      const userId = data.split("_")[1];
-      await supabase.from('usuarios').update({ status: "ativo" }).eq('chat_id', userId);
-      await supabase.from('admin_logs').insert([{ admin_id: fromId, acao: 'liberar', alvo_chat_id: userId }]).catch(() => {});
-      await bot.answerCallbackQuery(callbackQuery.id, { text: `Usuário ${userId} liberado.` });
-      return bot.sendMessage(fromId, `✅ Usuário ${userId} liberado manualmente.`);
-    }
-
-    if (data.startsWith("RESET_")) {
-      const userId = data.split("_")[1];
-      const novaData = new Date();
-      novaData.setDate(novaData.getDate() + 7);
-      await supabase.from('usuarios').update({ expires_at: novaData, ja_usou_trial: true }).eq('chat_id', userId);
-      await supabase.from('admin_logs').insert([{ admin_id: fromId, acao: 'reset_trial', alvo_chat_id: userId }]).catch(() => {});
-      await bot.answerCallbackQuery(callbackQuery.id, { text: `Trial do usuário ${userId} resetado.` });
-      return bot.sendMessage(fromId, `🔄 Trial do usuário ${userId} resetado por 7 dias.`);
-    }
-
-    // fallback
-    await bot.answerCallbackQuery(callbackQuery.id);
-  } catch (err) {
-    console.error("callback_query error:", err);
-    try { await bot.answerCallbackQuery(callbackQuery.id, { text: "Erro interno." }); } catch (e) {}
-  }
-});
-
-// ===== Webhook Mercado Pago =====
-app.post('/webhook', async (req, res) => {
-  try {
-    const { id, type } = req.body || {};
-    console.log("Webhook recebido:", req.body);
-    if (type !== 'payment') return res.sendStatus(200);
-
-    const result = await mpPayment.get({ id });
-    // resultado pode vir em result.body ou result diretamente dependendo da lib/versão
-    const metadata = result?.metadata || result?.body?.metadata || {};
-    const chatId = metadata?.chat_id;
-    const status = result?.status || result?.body?.status;
-
-    if (chatId) {
-      // marca pagamento e libera acesso
-      const novaData = new Date();
-      novaData.setMonth(novaData.getMonth() + 1);
-      await supabase.from('usuarios').update({ status: "ativo", expires_at: novaData, tentativas_pix: 0 }).eq('chat_id', chatId);
-      await supabase.from('pagamentos').insert([{
-        payment_id: id,
-        chat_id: chatId,
-        status: status || 'approved',
-        valor: result?.transaction_amount || result?.body?.transaction_amount || 10
-      }]).catch(() => {});
-      try {
-        await bot.sendMessage(Number(chatId), "✅ Pagamento confirmado! Acesso liberado por 1 mês.");
-      } catch (err) {
-        console.warn("Não foi possível enviar mensagem ao usuário (talvez chat_id inválido):", chatId, err);
-      }
-    } else {
-      console.warn("Webhook sem metadata.chat_id:", result);
-    }
-
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error("WEBHOOK ERROR:", err);
-    return res.sendStatus(500);
-  }
-});
-
-// ===== Start Express =====
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
-
-// ===== Tratamento básico de erros não capturados =====
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled Rejection:', reason);
-});
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err);
-});
+      return bot.sendMessage(fromId, `🚫
