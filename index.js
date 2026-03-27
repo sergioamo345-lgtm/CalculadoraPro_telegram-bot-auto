@@ -46,8 +46,7 @@ app.post('/telegram-webhook', async (req, res) => {
 
 // ===== DEVICE ID =====
 function gerarDeviceId(msg) {
-    const safeUser = (msg.from.username || "no_user").replace(/[^a-zA-Z0-9_-]/g, "");
-    return `${msg.from.id}_${safeUser}`;
+    return `${msg.from.id}_${msg.from.username || "no_user"}`;
 }
 
 // ===== VERIFICAR ACESSO =====
@@ -127,8 +126,6 @@ async function criarPagamento(chatId) {
                 items: [{
                     id: "assinatura",
                     title: "Plano 30 dias",
-                    description: "Acesso completo à Calculadora Moto Pro",
-                    category_id: "services",
                     quantity: 1,
                     unit_price: 10
                 }]
@@ -141,8 +138,7 @@ async function criarPagamento(chatId) {
             payment_id: result.id,
             chat_id: chatId,
             status: "pending",
-            valor: 10,
-            external_reference: paymentData.external_reference
+            valor: 10
         }]);
 
         return result;
@@ -201,25 +197,15 @@ bot.onText(/\/assinatura/, async (msg) => {
 // ===== WEBHOOK =====
 app.post('/webhook', async (req, res) => {
     try {
+        console.log("🔥 WEBHOOK:", req.body);
+
         const paymentId = req.body.data?.id || req.body.resource;
         if (!paymentId) return res.sendStatus(200);
 
         const result = await payment.get({ id: paymentId });
+
         const status = result.status;
         const chat_id = result.metadata?.chat_id;
-
-        console.log(`💰 Webhook: Payment ${paymentId}, Status: ${status}`);
-
-        // Evita reprocessar pagamentos já aprovados
-        const { data: registro } = await supabase
-            .from('pagamentos')
-            .select('status')
-            .eq('payment_id', paymentId)
-            .single();
-
-        if (registro && registro.status === "approved") {
-            return res.sendStatus(200);
-        }
 
         await supabase
             .from('pagamentos')
@@ -227,39 +213,6 @@ app.post('/webhook', async (req, res) => {
             .eq('payment_id', paymentId);
 
         if (status === "approved" && chat_id) {
+
             const novaData = new Date();
-            novaData.setDate(novaData.getDate() + 30);
-
-            await supabase.from('usuarios').upsert({
-                chat_id,
-                status: "ativo",
-                plano: "mensal",
-                expires_at: novaData
-            });
-
-            bot.sendMessage(chat_id, "✅ Pagamento aprovado! Acesso liberado 🚀");
-        }
-
-        res.sendStatus(200);
-    } catch (err) {
-        console.error("❌ ERRO WEBHOOK:", err);
-        res.sendStatus(500);
-    }
-});
-
-// ===== ADMIN =====
-app.get('/admin/usuarios', async (req, res) => {
-    if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
-    const { data, error } = await supabase.from('usuarios').select('*');
-    if (error) return res.status(500).json(error);
-    res.json(data || []);
-});
-
-app.get('/admin/faturamento', async (req, res) => {
-    if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.sendStatus(403);
-    const { data, error } = await supabase.from('pagamentos').select('*').eq('status', 'approved');
-    if (error) return res.status(500).json(error);
-
-    let total = 0;
-    data.forEach(p => total += Number(p.valor));
-    res
+            novaData
