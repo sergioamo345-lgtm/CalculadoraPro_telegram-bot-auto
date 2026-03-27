@@ -192,5 +192,4 @@ Tentativas PIX: ${u.tentativas_pix}`;
             .from('logs_suspeitos')
             .select('*')
             .limit(20)
-            .order('data', { ascending: false });
-        if (!logs
+            .order('data', { ascending:
