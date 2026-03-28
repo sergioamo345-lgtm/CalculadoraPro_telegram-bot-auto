@@ -24,9 +24,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app      = express();
 app.use(express.json());
 
-// Ignora mensagens antigas ao reiniciar (evita duplicatas no Render)
 const BOT_START_TIME = Math.floor(Date.now() / 1000);
-
 const pixCache = new Map();
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -156,7 +154,7 @@ bot.onText(/\/assinatura/, async (msg) => {
   }
 });
 
-// ── /comprar ─────────────────────────────────────────────────
+// ── /comprar (Telegram) ──────────────────────────────────────
 bot.onText(/\/comprar/, async (msg) => {
   if (msg.date < BOT_START_TIME) return;
   const chatId = msg.chat.id;
@@ -186,7 +184,6 @@ bot.onText(/\/comprar/, async (msg) => {
       criado_em:  new Date().toISOString(),
     });
 
-    // Unica mensagem: codigo + botao copiar + aviso de liberacao automatica
     await bot.sendMessage(chatId,
       "💰 *Assinatura CalculadoraPro – R$10,00*\n\n" +
       "`" + qr_code + "`\n\n" +
@@ -232,7 +229,6 @@ bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
   const data   = query.data || "";
 
-  // Copiar PIX — responde com alert na tela (sem nova mensagem)
   if (data.startsWith("copiar_pix:")) {
     const paymentId = data.replace("copiar_pix:", "");
     const qrCode    = pixCache.get(paymentId);
@@ -242,10 +238,7 @@ bot.on("callback_query", async (query) => {
       });
       return;
     }
-    // Mostra o codigo em um popup na tela para o usuario copiar
-    await bot.answerCallbackQuery(query.id, {
-      text: qrCode, show_alert: true
-    });
+    await bot.answerCallbackQuery(query.id, { text: qrCode, show_alert: true });
     return;
   }
 
@@ -386,6 +379,41 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
+// ── ✅ NOVO: Rota HTTP /comprar para o app Android ────────────
+app.post("/comprar", async (req, res) => {
+  try {
+    const { chat_id } = req.body;
+    if (!chat_id) return res.status(400).json({ error: "chat_id obrigatorio" });
+
+    const user = await getUser(chat_id);
+    if (user) {
+      await supabase.from("usuarios")
+        .update({ tentativas_pix: (user.tentativas_pix || 0) + 1 })
+        .eq("chat_id", String(chat_id));
+    }
+
+    const { payment_id, qr_code } = await criarPIX(chat_id);
+    if (!qr_code) return res.status(500).json({ error: "Falha ao gerar PIX" });
+
+    pixCache.set(String(payment_id), qr_code);
+
+    await supabase.from("pagamentos").insert({
+      chat_id:    String(chat_id),
+      payment_id: String(payment_id),
+      status:     "pendente",
+      valor:      10,
+      criado_em:  new Date().toISOString(),
+    });
+
+    res.json({ qr_code: null, pix_code: qr_code });
+
+  } catch (err) {
+    console.error("[/comprar HTTP]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Servidor ──────────────────────────────────────────────────
 app.get("/", (_req, res) => res.send("CalculadoraPro bot online"));
 app.listen(PORT, () => console.log("Servidor Express na porta " + PORT));
 
