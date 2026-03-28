@@ -24,10 +24,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app      = express();
 app.use(express.json());
 
-// Timestamp de inicio — ignora mensagens que chegaram antes do bot subir
 const BOT_START_TIME = Math.floor(Date.now() / 1000);
-
-const pixCache = new Map();
+const pixCache       = new Map();
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -104,9 +102,8 @@ async function criarPIX(chatId) {
     }
   );
   return {
-    payment_id:     data.id,
-    qr_code:        data.point_of_interaction?.transaction_data?.qr_code,
-    qr_code_base64: data.point_of_interaction?.transaction_data?.qr_code_base64,
+    payment_id: data.id,
+    qr_code:    data.point_of_interaction?.transaction_data?.qr_code,
   };
 }
 
@@ -156,7 +153,7 @@ bot.onText(/\/assinatura/, async (msg) => {
   try {
     const { ok, motivo } = await verificarAcesso(chatId);
     await bot.sendMessage(chatId,
-      (ok ? "Ativo" : "Inativo") + " - *Status da assinatura*\n\n" + motivo,
+      (ok ? "✅ *Acesso ativo*" : "❌ *Sem acesso*") + "\n\n" + motivo,
       { parse_mode: "Markdown" });
   } catch (err) {
     console.error("[/assinatura]", err.message);
@@ -177,9 +174,9 @@ bot.onText(/\/comprar/, async (msg) => {
         .eq("chat_id", String(chatId));
     }
 
-    await bot.sendMessage(chatId, "Gerando seu PIX de R$10,00...");
+    await bot.sendMessage(chatId, "⏳ Gerando seu PIX...");
 
-    const { payment_id, qr_code, qr_code_base64 } = await criarPIX(chatId);
+    const { payment_id, qr_code } = await criarPIX(chatId);
 
     if (!qr_code) {
       await bot.sendMessage(chatId, "Nao foi possivel gerar o PIX. Tente novamente.");
@@ -196,23 +193,17 @@ bot.onText(/\/comprar/, async (msg) => {
       criado_em:  new Date().toISOString(),
     });
 
-    if (qr_code_base64) {
-      try {
-        await bot.sendPhoto(chatId, Buffer.from(qr_code_base64, "base64"), {
-          caption: "PIX de R$10,00 gerado! Escaneie o QR Code ou copie o codigo abaixo.",
-        });
-      } catch (imgErr) {
-        console.error("[/comprar] Erro imagem QR:", imgErr.message);
-      }
-    }
-
+    // Mensagem explicando o processo + codigo PIX + botao copiar
     await bot.sendMessage(chatId,
-      "Codigo PIX (toque para copiar):\n\n`" + qr_code + "`",
+      "💰 *Assinatura CalculadoraPro – R$10,00*\n\n" +
+      "Copie o codigo PIX abaixo e pague no seu banco:\n\n" +
+      "`" + qr_code + "`\n\n" +
+      "⚡ Assim que o pagamento for confirmado, seu acesso sera liberado imediatamente!",
       {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [[
-            { text: "Copiar codigo PIX", callback_data: "copiar_pix:" + payment_id },
+            { text: "📋 Copiar codigo PIX", callback_data: "copiar_pix:" + payment_id },
           ]],
         },
       }
@@ -235,11 +226,11 @@ bot.onText(/\/admin/, async (msg) => {
     parse_mode: "Markdown",
     reply_markup: {
       inline_keyboard: [
-        [{ text: "Ver usuarios",     callback_data: "admin:listar_usuarios"    }],
-        [{ text: "Bloquear usuario", callback_data: "admin:bloquear_prompt"    }],
-        [{ text: "Liberar usuario",  callback_data: "admin:liberar_prompt"     }],
-        [{ text: "Reset trial",      callback_data: "admin:reset_trial_prompt" }],
-        [{ text: "Logs suspeitos",   callback_data: "admin:logs_suspeitos"     }],
+        [{ text: "👥 Ver usuarios",     callback_data: "admin:listar_usuarios"    }],
+        [{ text: "🚫 Bloquear usuario", callback_data: "admin:bloquear_prompt"    }],
+        [{ text: "✅ Liberar usuario",  callback_data: "admin:liberar_prompt"     }],
+        [{ text: "🔄 Reset trial",      callback_data: "admin:reset_trial_prompt" }],
+        [{ text: "⚠️ Logs suspeitos",   callback_data: "admin:logs_suspeitos"     }],
       ],
     },
   });
@@ -250,18 +241,24 @@ bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
   const data   = query.data || "";
 
+  // Copiar PIX
   if (data.startsWith("copiar_pix:")) {
     const paymentId = data.replace("copiar_pix:", "");
     const qrCode    = pixCache.get(paymentId);
     if (!qrCode) {
-      await bot.answerCallbackQuery(query.id, { text: "Codigo expirado. Gere um novo com /comprar.", show_alert: true });
+      await bot.answerCallbackQuery(query.id, {
+        text: "Codigo expirado. Use /comprar para gerar um novo.", show_alert: true
+      });
       return;
     }
-    await bot.sendMessage(chatId, "Codigo PIX (toque para copiar):\n\n`" + qrCode + "`", { parse_mode: "Markdown" });
-    await bot.answerCallbackQuery(query.id, { text: "Codigo PIX enviado!" });
+    await bot.sendMessage(chatId,
+      "📋 *Codigo PIX (toque para copiar):*\n\n`" + qrCode + "`",
+      { parse_mode: "Markdown" });
+    await bot.answerCallbackQuery(query.id, { text: "Codigo copiado!" });
     return;
   }
 
+  // Admin apenas
   if (!isAdmin(chatId)) {
     await bot.answerCallbackQuery(query.id, { text: "Acesso negado.", show_alert: true });
     return;
@@ -277,7 +274,7 @@ bot.on("callback_query", async (query) => {
       return;
     }
     const linhas = usuarios.map(u =>
-      "- `" + u.chat_id + "` - " + u.status + (u.bloqueado ? " [BLOQ]" : "") + " | PIX: " + (u.tentativas_pix || 0)
+      "- `" + u.chat_id + "` " + u.status + (u.bloqueado ? " [BLOQ]" : "") + " | PIX: " + (u.tentativas_pix || 0)
     );
     await bot.sendMessage(chatId, "*Usuarios (ultimos 20):*\n\n" + linhas.join("\n"), { parse_mode: "Markdown" });
     return;
@@ -318,20 +315,20 @@ bot.on("callback_query", async (query) => {
 
       try {
         if (acao === "bloquear_prompt") {
-          const { error } = await supabase.from("usuarios").update({ bloqueado: true }).eq("chat_id", targetId);
+          const { error } = await supabase.from("usuarios")
+            .update({ bloqueado: true }).eq("chat_id", targetId);
           if (error) throw new Error(error.message);
-          await bot.sendMessage(chatId, "Usuario `" + targetId + "` bloqueado.", { parse_mode: "Markdown" });
+          await bot.sendMessage(chatId, "🚫 Usuario `" + targetId + "` bloqueado.", { parse_mode: "Markdown" });
 
         } else if (acao === "liberar_prompt") {
           const { error } = await supabase.from("usuarios")
             .update({ bloqueado: false, status: "ativo", assinatura_expira: futureDate(30) })
             .eq("chat_id", targetId);
           if (error) throw new Error(error.message);
-          await bot.sendMessage(chatId, "Usuario `" + targetId + "` liberado por 30 dias.", { parse_mode: "Markdown" });
-          // Notifica o usuario
+          await bot.sendMessage(chatId, "✅ Usuario `" + targetId + "` liberado por 30 dias.", { parse_mode: "Markdown" });
           try {
             await bot.sendMessage(targetId,
-              "Seu acesso ao *CalculadoraPro* foi liberado!\n\nValido por 30 dias.",
+              "✅ *Seu acesso foi liberado!*\n\nBem-vindo ao *CalculadoraPro*. Valido por 30 dias.",
               { parse_mode: "Markdown" });
           } catch (_) {}
 
@@ -340,7 +337,7 @@ bot.on("callback_query", async (query) => {
             .update({ status: "trial", trial_expira: futureDate(7), bloqueado: false })
             .eq("chat_id", targetId);
           if (error) throw new Error(error.message);
-          await bot.sendMessage(chatId, "Trial de `" + targetId + "` resetado por 7 dias.", { parse_mode: "Markdown" });
+          await bot.sendMessage(chatId, "🔄 Trial de `" + targetId + "` resetado por 7 dias.", { parse_mode: "Markdown" });
         }
       } catch (err) {
         await bot.sendMessage(chatId, "Erro: " + err.message);
@@ -387,9 +384,9 @@ app.post("/webhook", async (req, res) => {
       .eq("chat_id", String(chatId));
 
     await bot.sendMessage(chatId,
-      "*Pagamento confirmado!*\n\n" +
-      "Assinatura do *CalculadoraPro* ativa por 30 dias.\n" +
-      "Valida ate: " + new Date(expira).toLocaleDateString("pt-BR"),
+      "🎉 *Pagamento confirmado!*\n\n" +
+      "✅ Seu acesso ao *CalculadoraPro* esta ativo por 30 dias.\n" +
+      "📅 Valido ate: " + new Date(expira).toLocaleDateString("pt-BR"),
       { parse_mode: "Markdown" });
 
     console.log("[webhook] Pagamento " + paymentId + " aprovado para chat_id " + chatId);
