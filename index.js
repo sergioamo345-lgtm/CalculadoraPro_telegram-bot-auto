@@ -9,73 +9,77 @@ const TELEGRAM_TOKEN  = process.env.TELEGRAM_TOKEN;
 const SUPABASE_URL    = process.env.SUPABASE_URL;
 const SUPABASE_KEY    = process.env.SUPABASE_KEY;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const ADMIN_IDS       = (process.env.ADMIN_IDS || "").split(",").map(id => id.trim()).filter(Boolean);
 const PORT            = parseInt(process.env.PORT || "10000", 10);
 
 if (!TELEGRAM_TOKEN || !SUPABASE_URL || !SUPABASE_KEY || !MP_ACCESS_TOKEN) {
-  console.error("Variaveis de ambiente obrigatorias nao definidas.");
+  console.error("Variaveis obrigatorias nao definidas.");
   process.exit(1);
 }
 
-const bot      = new TelegramBot(TELEGRAM_TOKEN, {
-  polling: { params: { timeout: 10, allowed_updates: ["message", "callback_query"] } }
-});
+const bot      = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app      = express();
 app.use(express.json());
 
-const BOT_START_TIME = Math.floor(Date.now() / 1000);
-const pixCache = new Map();
+// ─────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────
 
-// ── Helpers ──────────────────────────────────────────────────
-
-const isAdmin    = (chatId) => ADMIN_IDS.includes(String(chatId));
-const futureDate = (days)   => { const d = new Date(); d.setDate(d.getDate() + days); return d.toISOString(); };
+const futureDate = (days) => {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString();
+};
 
 async function getUser(chatId) {
   const { data, error } = await supabase
-    .from("usuarios").select("*").eq("chat_id", String(chatId)).maybeSingle();
-  if (error) throw new Error(error.message || JSON.stringify(error));
+    .from("usuarios")
+    .select("*")
+    .eq("chat_id", String(chatId))
+    .maybeSingle();
+
+  if (error) throw new Error(error.message);
   return data;
 }
 
-async function createUser(chatId, deviceId) {
-  const { data, error } = await supabase.from("usuarios").insert({
-    chat_id:        String(chatId),
-    status:         "trial",
-    trial_expira:   futureDate(7),
-    tentativas_pix: 0,
-    device_id:      deviceId || null,
-    bloqueado:      false,
-    criado_em:      new Date().toISOString(),
-  }).select().single();
+// ─────────────────────────────────────────────
+// 🔥 VALIDAÇÃO + ANTI COMPARTILHAMENTO
+// ─────────────────────────────────────────────
 
-  if (error) throw new Error(error.message || JSON.stringify(error));
-  return data;
-}
-
-// 🔥 VALIDAÇÃO CENTRAL (AGORA COM DEVICE_ID)
 async function verificarAcesso(chatId, deviceId) {
-  const user = await getUser(chatId);
+  let user;
+
+  try {
+    user = await getUser(chatId);
+  } catch (e) {
+    return { ativo: false };
+  }
 
   if (!user) return { ativo: false };
 
-  const agora = new Date();
+  // 🔥 BLOQUEADO
+  if (user.bloqueado) {
+    return { ativo: false, motivo: "bloqueado" };
+  }
 
-  // 🔥 EXPIRAÇÃO
+  const agora = new Date();
   let ativo = false;
 
+  // 🔥 ASSINATURA
   if (user.status === "ativo") {
     const expira = new Date(user.assinatura_expira);
     ativo = expira > agora;
   }
 
+  // 🔥 TRIAL
   if (user.status === "trial") {
     const expira = new Date(user.trial_expira);
     ativo = expira > agora;
   }
 
-  if (!ativo) return { ativo: false };
+  if (!ativo) {
+    return { ativo: false, motivo: "expirado" };
+  }
 
   // 🔥 ANTI COMPARTILHAMENTO
   if (!user.device_id) {
@@ -83,6 +87,7 @@ async function verificarAcesso(chatId, deviceId) {
       .from("usuarios")
       .update({ device_id: deviceId })
       .eq("chat_id", String(chatId));
+
   } else if (user.device_id !== deviceId) {
 
     await supabase.from("logs_suspeitos").insert({
@@ -104,13 +109,19 @@ async function verificarAcesso(chatId, deviceId) {
   };
 }
 
-// ── 🔥 NOVA ROTA PARA O APP ANDROID ───────────────────────────
+// ─────────────────────────────────────────────
+// 📱 ROTA PARA APP ANDROID
+// ─────────────────────────────────────────────
+
 app.post("/assinatura", async (req, res) => {
   try {
     const { chat_id, device_id } = req.body;
 
     if (!chat_id || !device_id) {
-      return res.json({ ativo: false });
+      return res.json({
+        ativo: false,
+        motivo: "dados_invalidos"
+      });
     }
 
     const result = await verificarAcesso(chat_id, device_id);
@@ -123,17 +134,19 @@ app.post("/assinatura", async (req, res) => {
   }
 });
 
-// ── PIX ──────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 💰 GERAR PIX
+// ─────────────────────────────────────────────
 
 async function criarPIX(chatId) {
   const { data } = await axios.post(
     "https://api.mercadopago.com/v1/payments",
     {
       transaction_amount: 10,
-      description: "CalculadoraPro - Assinatura mensal",
+      description: "CalculadoraPro - Assinatura",
       payment_method_id: "pix",
       payer: {
-        email: "usuario_" + chatId + "@app.com",
+        email: "user_" + chatId + "@app.com",
       },
       external_reference: String(chatId),
     },
@@ -151,7 +164,39 @@ async function criarPIX(chatId) {
   };
 }
 
-// ── WEBHOOK ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// 💳 ROTA COMPRAR (APP)
+// ─────────────────────────────────────────────
+
+app.post("/comprar", async (req, res) => {
+  try {
+    const { chat_id } = req.body;
+
+    if (!chat_id) {
+      return res.status(400).json({ error: "chat_id obrigatorio" });
+    }
+
+    const { payment_id, qr_code } = await criarPIX(chat_id);
+
+    await supabase.from("pagamentos").insert({
+      chat_id: String(chat_id),
+      payment_id: String(payment_id),
+      status: "pendente",
+      valor: 10,
+      criado_em: new Date().toISOString(),
+    });
+
+    res.json({ pix_code: qr_code });
+
+  } catch (err) {
+    console.error("[/comprar]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
+// 🔔 WEBHOOK MERCADO PAGO
+// ─────────────────────────────────────────────
 
 app.post("/webhook", async (req, res) => {
   try {
@@ -168,8 +213,14 @@ app.post("/webhook", async (req, res) => {
 
     const chatId = data.external_reference;
 
+    // 🔥 ATUALIZA PAGAMENTO
+    await supabase.from("pagamentos")
+      .update({ status: "aprovado" })
+      .eq("payment_id", String(paymentId));
+
     const expira = futureDate(30);
 
+    // 🔥 LIBERA USUÁRIO
     await supabase.from("usuarios")
       .update({
         status: "ativo",
@@ -181,12 +232,14 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(200);
 
   } catch (err) {
-    console.error(err);
+    console.error("[webhook]", err.message);
     res.sendStatus(500);
   }
 });
 
-// ── SERVER ───────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// SERVER
+// ─────────────────────────────────────────────
 
-app.get("/", (_, res) => res.send("OK"));
+app.get("/", (_, res) => res.send("Servidor online"));
 app.listen(PORT, () => console.log("Rodando na porta " + PORT));
