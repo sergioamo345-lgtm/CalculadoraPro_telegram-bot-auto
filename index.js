@@ -24,8 +24,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app      = express();
 app.use(express.json());
 
+// Ignora mensagens antigas ao reiniciar (evita duplicatas no Render)
 const BOT_START_TIME = Math.floor(Date.now() / 1000);
-const pixCache       = new Map();
+
+const pixCache = new Map();
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -110,19 +112,16 @@ async function criarPIX(chatId) {
 // ── /start ───────────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
   if (msg.date < BOT_START_TIME) return;
-
   const chatId   = msg.chat.id;
   const username = msg.from?.username || msg.from?.first_name || "usuario";
   const deviceId = "tg_" + chatId;
 
   try {
     const existing = await getUser(chatId);
-
     if (existing) {
-      if (existing.device_id && existing.device_id !== deviceId) {
-        await registrarLogSuspeito(chatId, "multi_device",
-          "device anterior: " + existing.device_id + " | novo: " + deviceId);
-      }
+      if (existing.device_id && existing.device_id !== deviceId)
+        await registrarLogSuspeito(chatId, "multi_device", "anterior: " + existing.device_id + " | novo: " + deviceId);
+
       await bot.sendMessage(chatId,
         "Bem-vindo de volta, *" + username + "*!\n\nUse /assinatura para ver seu status.",
         { parse_mode: "Markdown" });
@@ -130,13 +129,10 @@ bot.onText(/\/start/, async (msg) => {
     }
 
     await createUser(chatId, deviceId);
-
     await bot.sendMessage(chatId,
       "Bem-vindo ao *CalculadoraPro*, " + username + "!\n\n" +
       "Seu *trial gratuito de 7 dias* foi ativado.\n\n" +
-      "Comandos disponiveis:\n" +
-      "/assinatura - ver status\n" +
-      "/comprar - assinar por R$10/mes",
+      "Comandos:\n/assinatura - ver status\n/comprar - assinar por R$10/mes",
       { parse_mode: "Markdown" });
 
   } catch (err) {
@@ -148,7 +144,6 @@ bot.onText(/\/start/, async (msg) => {
 // ── /assinatura ──────────────────────────────────────────────
 bot.onText(/\/assinatura/, async (msg) => {
   if (msg.date < BOT_START_TIME) return;
-
   const chatId = msg.chat.id;
   try {
     const { ok, motivo } = await verificarAcesso(chatId);
@@ -157,15 +152,15 @@ bot.onText(/\/assinatura/, async (msg) => {
       { parse_mode: "Markdown" });
   } catch (err) {
     console.error("[/assinatura]", err.message);
-    await bot.sendMessage(chatId, "Erro ao verificar: " + err.message);
+    await bot.sendMessage(chatId, "Erro: " + err.message);
   }
 });
 
 // ── /comprar ─────────────────────────────────────────────────
 bot.onText(/\/comprar/, async (msg) => {
   if (msg.date < BOT_START_TIME) return;
-
   const chatId = msg.chat.id;
+
   try {
     const user = await getUser(chatId);
     if (user) {
@@ -173,8 +168,6 @@ bot.onText(/\/comprar/, async (msg) => {
         .update({ tentativas_pix: (user.tentativas_pix || 0) + 1 })
         .eq("chat_id", String(chatId));
     }
-
-    await bot.sendMessage(chatId, "⏳ Gerando seu PIX...");
 
     const { payment_id, qr_code } = await criarPIX(chatId);
 
@@ -193,10 +186,9 @@ bot.onText(/\/comprar/, async (msg) => {
       criado_em:  new Date().toISOString(),
     });
 
-    // Mensagem explicando o processo + codigo PIX + botao copiar
+    // Unica mensagem: codigo + botao copiar + aviso de liberacao automatica
     await bot.sendMessage(chatId,
       "💰 *Assinatura CalculadoraPro – R$10,00*\n\n" +
-      "Copie o codigo PIX abaixo e pague no seu banco:\n\n" +
       "`" + qr_code + "`\n\n" +
       "⚡ Assim que o pagamento for confirmado, seu acesso sera liberado imediatamente!",
       {
@@ -218,7 +210,6 @@ bot.onText(/\/comprar/, async (msg) => {
 // ── /admin ───────────────────────────────────────────────────
 bot.onText(/\/admin/, async (msg) => {
   if (msg.date < BOT_START_TIME) return;
-
   const chatId = msg.chat.id;
   if (!isAdmin(chatId)) { await bot.sendMessage(chatId, "Acesso negado."); return; }
 
@@ -241,7 +232,7 @@ bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
   const data   = query.data || "";
 
-  // Copiar PIX
+  // Copiar PIX — responde com alert na tela (sem nova mensagem)
   if (data.startsWith("copiar_pix:")) {
     const paymentId = data.replace("copiar_pix:", "");
     const qrCode    = pixCache.get(paymentId);
@@ -251,14 +242,13 @@ bot.on("callback_query", async (query) => {
       });
       return;
     }
-    await bot.sendMessage(chatId,
-      "📋 *Codigo PIX (toque para copiar):*\n\n`" + qrCode + "`",
-      { parse_mode: "Markdown" });
-    await bot.answerCallbackQuery(query.id, { text: "Codigo copiado!" });
+    // Mostra o codigo em um popup na tela para o usuario copiar
+    await bot.answerCallbackQuery(query.id, {
+      text: qrCode, show_alert: true
+    });
     return;
   }
 
-  // Admin apenas
   if (!isAdmin(chatId)) {
     await bot.answerCallbackQuery(query.id, { text: "Acesso negado.", show_alert: true });
     return;
@@ -315,8 +305,7 @@ bot.on("callback_query", async (query) => {
 
       try {
         if (acao === "bloquear_prompt") {
-          const { error } = await supabase.from("usuarios")
-            .update({ bloqueado: true }).eq("chat_id", targetId);
+          const { error } = await supabase.from("usuarios").update({ bloqueado: true }).eq("chat_id", targetId);
           if (error) throw new Error(error.message);
           await bot.sendMessage(chatId, "🚫 Usuario `" + targetId + "` bloqueado.", { parse_mode: "Markdown" });
 
@@ -398,7 +387,6 @@ app.post("/webhook", async (req, res) => {
 });
 
 app.get("/", (_req, res) => res.send("CalculadoraPro bot online"));
-
 app.listen(PORT, () => console.log("Servidor Express na porta " + PORT));
 
 process.on("unhandledRejection", (reason) => console.error("unhandledRejection:", reason));
