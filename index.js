@@ -1,29 +1,31 @@
 "use strict";
 
-const TelegramBot      = require("node-telegram-bot-api");
 const { createClient } = require("@supabase/supabase-js");
-const express          = require("express");
-const axios            = require("axios");
+const express = require("express");
+const axios = require("axios");
+const TelegramBot = require("node-telegram-bot-api");
 
-const TELEGRAM_TOKEN  = process.env.TELEGRAM_TOKEN;
-const SUPABASE_URL    = process.env.SUPABASE_URL;
-const SUPABASE_KEY    = process.env.SUPABASE_KEY;
+// ─────────────────────────────
+// CONFIG
+// ─────────────────────────────
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const PORT            = parseInt(process.env.PORT || "10000", 10);
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",");
+const PORT = process.env.PORT || 10000;
 
-if (!TELEGRAM_TOKEN || !SUPABASE_URL || !SUPABASE_KEY || !MP_ACCESS_TOKEN) {
-  console.error("Variaveis obrigatorias nao definidas.");
-  process.exit(1);
-}
-
-const bot      = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-const app      = express();
+const app = express();
 app.use(express.json());
 
-// ─────────────────────────────────────────────
+// BOT ADMIN
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+
+// ─────────────────────────────
 // HELPERS
-// ─────────────────────────────────────────────
+// ─────────────────────────────
 
 const futureDate = (days) => {
   const d = new Date();
@@ -31,177 +33,179 @@ const futureDate = (days) => {
   return d.toISOString();
 };
 
-async function getUser(chatId) {
-  const { data, error } = await supabase
-    .from("usuarios")
-    .select("*")
-    .eq("chat_id", String(chatId))
-    .maybeSingle();
-
-  if (error) throw new Error(error.message);
-  return data;
+function isAdmin(chatId) {
+  return ADMIN_IDS.includes(String(chatId));
 }
 
-// ─────────────────────────────────────────────
-// 🔥 VALIDAÇÃO + ANTI COMPARTILHAMENTO
-// ─────────────────────────────────────────────
+// ─────────────────────────────
+// 🔐 REGISTER
+// ─────────────────────────────
 
-async function verificarAcesso(chatId, deviceId) {
-  let user;
-
+app.post("/register", async (req, res) => {
   try {
-    user = await getUser(chatId);
-  } catch (e) {
-    return { ativo: false };
+    const { email, senha, device_id } = req.body;
+
+    if (!email || !senha || !device_id) {
+      return res.json({ ok: false });
+    }
+
+    const { data, error } = await supabase.from("usuarios").insert({
+      email,
+      senha,
+      device_id,
+      status: "trial",
+      trial_expira: futureDate(7),
+      bloqueado: false
+    }).select().single();
+
+    if (error) return res.json({ ok: false, error: error.message });
+
+    res.json({ ok: true, user_id: data.id });
+
+  } catch {
+    res.json({ ok: false });
   }
+});
 
-  if (!user) return { ativo: false };
+// ─────────────────────────────
+// 🔑 LOGIN
+// ─────────────────────────────
 
-  // 🔥 BLOQUEADO
-  if (user.bloqueado) {
-    return { ativo: false, motivo: "bloqueado" };
-  }
+app.post("/login", async (req, res) => {
+  try {
+    const { email, senha, device_id } = req.body;
 
-  const agora = new Date();
-  let ativo = false;
-
-  // 🔥 ASSINATURA
-  if (user.status === "ativo") {
-    const expira = new Date(user.assinatura_expira);
-    ativo = expira > agora;
-  }
-
-  // 🔥 TRIAL
-  if (user.status === "trial") {
-    const expira = new Date(user.trial_expira);
-    ativo = expira > agora;
-  }
-
-  if (!ativo) {
-    return { ativo: false, motivo: "expirado" };
-  }
-
-  // 🔥 ANTI COMPARTILHAMENTO
-  if (!user.device_id) {
-    await supabase
+    const { data: user } = await supabase
       .from("usuarios")
-      .update({ device_id: deviceId })
-      .eq("chat_id", String(chatId));
+      .select("*")
+      .eq("email", email)
+      .eq("senha", senha)
+      .single();
 
-  } else if (user.device_id !== deviceId) {
+    if (!user) return res.json({ ok: false });
 
-    await supabase.from("logs_suspeitos").insert({
-      chat_id: String(chatId),
-      tipo: "multi_device",
-      detalhe: `Registrado: ${user.device_id} | Novo: ${deviceId}`,
-      criado_em: new Date().toISOString()
-    });
+    if (user.bloqueado) {
+      return res.json({ ok: false, motivo: "bloqueado" });
+    }
 
-    return {
-      ativo: false,
-      motivo: "dispositivo_nao_autorizado"
-    };
+    // 🔥 ANTI COMPARTILHAMENTO
+    if (!user.device_id) {
+      await supabase.from("usuarios")
+        .update({ device_id })
+        .eq("id", user.id);
+
+    } else if (user.device_id !== device_id) {
+      return res.json({ ok: false, motivo: "outro_celular" });
+    }
+
+    res.json({ ok: true, user_id: user.id });
+
+  } catch {
+    res.json({ ok: false });
   }
+});
 
-  return {
-    ativo: true,
-    expira_em: user.assinatura_expira || user.trial_expira
-  };
-}
-
-// ─────────────────────────────────────────────
-// 📱 ROTA PARA APP ANDROID
-// ─────────────────────────────────────────────
+// ─────────────────────────────
+// 🔥 VALIDAÇÃO APP
+// ─────────────────────────────
 
 app.post("/assinatura", async (req, res) => {
   try {
-    const { chat_id, device_id } = req.body;
+    const { user_id, device_id } = req.body;
 
-    if (!chat_id || !device_id) {
-      return res.json({
-        ativo: false,
-        motivo: "dados_invalidos"
-      });
+    const { data: user } = await supabase
+      .from("usuarios")
+      .select("*")
+      .eq("id", user_id)
+      .single();
+
+    if (!user) return res.json({ ativo: false });
+
+    if (user.bloqueado) return res.json({ ativo: false });
+
+    const agora = new Date();
+    let ativo = false;
+
+    if (user.status === "ativo") {
+      ativo = new Date(user.assinatura_expira) > agora;
     }
 
-    const result = await verificarAcesso(chat_id, device_id);
+    if (user.status === "trial") {
+      ativo = new Date(user.trial_expira) > agora;
+    }
 
-    res.json(result);
+    if (!ativo) return res.json({ ativo: false });
 
-  } catch (err) {
-    console.error("[/assinatura]", err.message);
+    // 🔥 ANTI COMPARTILHAMENTO
+    if (user.device_id !== device_id) {
+      return res.json({ ativo: false });
+    }
+
+    res.json({ ativo: true });
+
+  } catch {
     res.json({ ativo: false });
   }
 });
 
-// ─────────────────────────────────────────────
-// 💰 GERAR PIX
-// ─────────────────────────────────────────────
+// ─────────────────────────────
+// 💰 PIX
+// ─────────────────────────────
 
-async function criarPIX(chatId) {
+async function criarPIX(user_id) {
   const { data } = await axios.post(
     "https://api.mercadopago.com/v1/payments",
     {
       transaction_amount: 10,
-      description: "CalculadoraPro - Assinatura",
+      description: "Assinatura App",
       payment_method_id: "pix",
-      payer: {
-        email: "user_" + chatId + "@app.com",
-      },
-      external_reference: String(chatId),
+      payer: { email: "user@app.com" },
+      external_reference: String(user_id),
     },
     {
       headers: {
         Authorization: "Bearer " + MP_ACCESS_TOKEN,
-        "Content-Type": "application/json",
       },
     }
   );
 
   return {
     payment_id: data.id,
-    qr_code: data.point_of_interaction?.transaction_data?.qr_code,
+    qr_code: data.point_of_interaction?.transaction_data?.qr_code
   };
 }
 
-// ─────────────────────────────────────────────
-// 💳 ROTA COMPRAR (APP)
-// ─────────────────────────────────────────────
+// ─────────────────────────────
+// 💳 COMPRAR
+// ─────────────────────────────
 
 app.post("/comprar", async (req, res) => {
   try {
-    const { chat_id } = req.body;
+    const { user_id } = req.body;
 
-    if (!chat_id) {
-      return res.status(400).json({ error: "chat_id obrigatorio" });
-    }
-
-    const { payment_id, qr_code } = await criarPIX(chat_id);
+    const { payment_id, qr_code } = await criarPIX(user_id);
 
     await supabase.from("pagamentos").insert({
-      chat_id: String(chat_id),
-      payment_id: String(payment_id),
+      user_id,
+      payment_id,
       status: "pendente",
-      valor: 10,
-      criado_em: new Date().toISOString(),
+      valor: 10
     });
 
     res.json({ pix_code: qr_code });
 
-  } catch (err) {
-    console.error("[/comprar]", err.message);
-    res.status(500).json({ error: err.message });
+  } catch {
+    res.json({ error: true });
   }
 });
 
-// ─────────────────────────────────────────────
-// 🔔 WEBHOOK MERCADO PAGO
-// ─────────────────────────────────────────────
+// ─────────────────────────────
+// 🔔 WEBHOOK
+// ─────────────────────────────
 
 app.post("/webhook", async (req, res) => {
   try {
-    let paymentId = req.body?.data?.id;
-
+    const paymentId = req.body?.data?.id;
     if (!paymentId) return res.sendStatus(200);
 
     const { data } = await axios.get(
@@ -211,35 +215,99 @@ app.post("/webhook", async (req, res) => {
 
     if (data.status !== "approved") return res.sendStatus(200);
 
-    const chatId = data.external_reference;
+    const user_id = data.external_reference;
 
-    // 🔥 ATUALIZA PAGAMENTO
-    await supabase.from("pagamentos")
-      .update({ status: "aprovado" })
-      .eq("payment_id", String(paymentId));
-
-    const expira = futureDate(30);
-
-    // 🔥 LIBERA USUÁRIO
     await supabase.from("usuarios")
       .update({
         status: "ativo",
-        assinatura_expira: expira,
-        bloqueado: false
+        assinatura_expira: futureDate(30)
       })
-      .eq("chat_id", String(chatId));
+      .eq("id", user_id);
 
     res.sendStatus(200);
 
-  } catch (err) {
-    console.error("[webhook]", err.message);
+  } catch {
     res.sendStatus(500);
   }
 });
 
-// ─────────────────────────────────────────────
-// SERVER
-// ─────────────────────────────────────────────
+// ─────────────────────────────
+// 🤖 ADMIN TELEGRAM
+// ─────────────────────────────
 
-app.get("/", (_, res) => res.send("Servidor online"));
-app.listen(PORT, () => console.log("Rodando na porta " + PORT));
+// /admin
+bot.onText(/\/admin/, (msg) => {
+  const chatId = msg.chat.id;
+
+  if (!isAdmin(chatId)) {
+    return bot.sendMessage(chatId, "Acesso negado");
+  }
+
+  bot.sendMessage(chatId,
+    "Painel Admin:\n\n" +
+    "/bloquear user_id\n" +
+    "/liberar user_id\n" +
+    "/usuarios"
+  );
+});
+
+// bloquear
+bot.onText(/\/bloquear (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(chatId)) return;
+
+  const userId = match[1];
+
+  await supabase.from("usuarios")
+    .update({ bloqueado: true })
+    .eq("id", userId);
+
+  bot.sendMessage(chatId, "🚫 Bloqueado: " + userId);
+});
+
+// liberar
+bot.onText(/\/liberar (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(chatId)) return;
+
+  const userId = match[1];
+
+  await supabase.from("usuarios")
+    .update({
+      bloqueado: false,
+      status: "ativo",
+      assinatura_expira: futureDate(30)
+    })
+    .eq("id", userId);
+
+  bot.sendMessage(chatId, "✅ Liberado: " + userId);
+});
+
+// listar
+bot.onText(/\/usuarios/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(chatId)) return;
+
+  const { data } = await supabase
+    .from("usuarios")
+    .select("id, email, status, bloqueado")
+    .limit(20);
+
+  if (!data) return bot.sendMessage(chatId, "Sem usuários");
+
+  const lista = data.map(u =>
+    `${u.id}\n${u.email}\n${u.status} ${u.bloqueado ? "🚫" : "✅"}`
+  ).join("\n\n");
+
+  bot.sendMessage(chatId, lista);
+});
+
+// ─────────────────────────────
+// SERVER
+// ─────────────────────────────
+
+app.get("/", (_, res) => res.send("SaaS rodando 🚀"));
+
+app.listen(PORT, () => {
+  console.log("Servidor rodando na porta " + PORT);
+});
