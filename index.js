@@ -1,313 +1,146 @@
-"use strict";
+require('dotenv').config();
+const express = require('express');
+const bodyParser = require('body-parser');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { createClient } = require('@supabase/supabase-js');
 
-const { createClient } = require("@supabase/supabase-js");
-const express = require("express");
-const axios = require("axios");
-const TelegramBot = require("node-telegram-bot-api");
-
-// ─────────────────────────────
-// CONFIG
-// ─────────────────────────────
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const ADMIN_IDS = (process.env.ADMIN_IDS || "").split(",");
-const PORT = process.env.PORT || 10000;
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app = express();
-app.use(express.json());
+app.use(bodyParser.json());
 
-// BOT ADMIN
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const JWT_SECRET = process.env.JWT_SECRET;
 
-// ─────────────────────────────
-// HELPERS
-// ─────────────────────────────
+// -------------------- Middleware de autenticação --------------------
+function autenticar(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1]; // Bearer <token>
 
-const futureDate = (days) => {
-  const d = new Date();
-  d.setDate(d.getDate() + days);
-  return d.toISOString();
-};
+    if (!token) return res.status(401).json({ ok: false, msg: "Token não fornecido" });
 
-function isAdmin(chatId) {
-  return ADMIN_IDS.includes(String(chatId));
+    try {
+        const payload = jwt.verify(token, JWT_SECRET);
+        req.user_id = payload.user_id;
+        next();
+    } catch (err) {
+        return res.status(401).json({ ok: false, msg: "Token inválido ou expirado" });
+    }
 }
 
-// ─────────────────────────────
-// 🔐 REGISTER
-// ─────────────────────────────
-
+// -------------------- Registro de usuário --------------------
 app.post("/register", async (req, res) => {
-  try {
-    const { email, senha, device_id } = req.body;
+    try {
+        const { email, senha, device_id } = req.body;
 
-    if (!email || !senha || !device_id) {
-      return res.json({ ok: false });
+        if (!email || !senha || !device_id) {
+            return res.status(400).json({ ok: false, msg: "Campos obrigatórios faltando" });
+        }
+
+        // Verifica se usuário já existe
+        const { data: existingUser } = await supabase
+            .from("usuarios")
+            .select("id")
+            .eq("email", email)
+            .single();
+
+        if (existingUser) return res.status(409).json({ ok: false, msg: "Usuário já existe" });
+
+        // Hash da senha
+        const senhaHash = await bcrypt.hash(senha, 10);
+
+        const { data, error } = await supabase
+            .from("usuarios")
+            .insert([{
+                email,
+                senha_hash: senhaHash,
+                device_id,
+                data_inicio_teste: new Date().toISOString(),
+                assinatura_ativa: false
+            }])
+            .select()
+            .single();
+
+        if (error) return res.status(500).json({ ok: false, error: error.message });
+
+        return res.status(201).json({ ok: true });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ ok: false, error: err.message });
     }
-
-    const { data, error } = await supabase.from("usuarios").insert({
-      email,
-      senha,
-      device_id,
-      status: "trial",
-      trial_expira: futureDate(7),
-      bloqueado: false
-    }).select().single();
-
-    if (error) return res.json({ ok: false, error: error.message });
-
-    res.json({ ok: true, user_id: data.id });
-
-  } catch {
-    res.json({ ok: false });
-  }
 });
 
-// ─────────────────────────────
-// 🔑 LOGIN
-// ─────────────────────────────
-
+// -------------------- Login --------------------
 app.post("/login", async (req, res) => {
-  try {
-    const { email, senha, device_id } = req.body;
+    try {
+        const { email, senha, device_id } = req.body;
 
-    const { data: user } = await supabase
-      .from("usuarios")
-      .select("*")
-      .eq("email", email)
-      .eq("senha", senha)
-      .single();
+        if (!email || !senha || !device_id) {
+            return res.status(400).json({ ok: false, msg: "Campos obrigatórios faltando" });
+        }
 
-    if (!user) return res.json({ ok: false });
+        const { data: user } = await supabase
+            .from("usuarios")
+            .select("*")
+            .eq("email", email)
+            .single();
 
-    if (user.bloqueado) {
-      return res.json({ ok: false, motivo: "bloqueado" });
+        if (!user) return res.status(401).json({ ok: false, msg: "Usuário ou senha inválidos" });
+
+        // Compara senha com hash
+        const senhaValida = await bcrypt.compare(senha, user.senha_hash);
+        if (!senhaValida) return res.status(401).json({ ok: false, msg: "Usuário ou senha inválidos" });
+
+        // Atualiza device_id
+        await supabase.from("usuarios")
+            .update({ device_id })
+            .eq("id", user.id);
+
+        // Gera token JWT
+        const token = jwt.sign({ user_id: user.id }, JWT_SECRET, { expiresIn: '7d' });
+
+        return res.json({ ok: true, token });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ ok: false, error: err.message });
     }
+});
 
-    // 🔥 ANTI COMPARTILHAMENTO
-    if (!user.device_id) {
-      await supabase.from("usuarios")
-        .update({ device_id })
-        .eq("id", user.id);
+// -------------------- Verificação de assinatura / teste --------------------
+// Rota protegida — requer token JWT no header: Authorization: Bearer <token>
+app.post("/assinatura", autenticar, async (req, res) => {
+    try {
+        const { device_id } = req.body;
 
-    } else if (user.device_id !== device_id) {
-      return res.json({ ok: false, motivo: "outro_celular" });
+        if (!device_id) {
+            return res.status(400).json({ ativo: false, msg: "device_id obrigatório" });
+        }
+
+        const { data: user } = await supabase
+            .from("usuarios")
+            .select("*")
+            .eq("id", req.user_id)
+            .single();
+
+        if (!user) return res.status(404).json({ ativo: false });
+
+        // Verifica se o device_id bate com o cadastrado
+        if (user.device_id !== device_id) {
+            return res.status(403).json({ ativo: false, msg: "Dispositivo não autorizado" });
+        }
+
+        const hoje = new Date();
+        const inicioTeste = new Date(user.data_inicio_teste);
+        const diasDecorridos = Math.floor((hoje - inicioTeste) / (1000 * 60 * 60 * 24));
+
+        const ativo = diasDecorridos < 7 || user.assinatura_ativa;
+
+        return res.json({ ativo });
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ ativo: false, error: err.message });
     }
-
-    res.json({ ok: true, user_id: user.id });
-
-  } catch {
-    res.json({ ok: false });
-  }
 });
 
-// ─────────────────────────────
-// 🔥 VALIDAÇÃO APP
-// ─────────────────────────────
-
-app.post("/assinatura", async (req, res) => {
-  try {
-    const { user_id, device_id } = req.body;
-
-    const { data: user } = await supabase
-      .from("usuarios")
-      .select("*")
-      .eq("id", user_id)
-      .single();
-
-    if (!user) return res.json({ ativo: false });
-
-    if (user.bloqueado) return res.json({ ativo: false });
-
-    const agora = new Date();
-    let ativo = false;
-
-    if (user.status === "ativo") {
-      ativo = new Date(user.assinatura_expira) > agora;
-    }
-
-    if (user.status === "trial") {
-      ativo = new Date(user.trial_expira) > agora;
-    }
-
-    if (!ativo) return res.json({ ativo: false });
-
-    // 🔥 ANTI COMPARTILHAMENTO
-    if (user.device_id !== device_id) {
-      return res.json({ ativo: false });
-    }
-
-    res.json({ ativo: true });
-
-  } catch {
-    res.json({ ativo: false });
-  }
-});
-
-// ─────────────────────────────
-// 💰 PIX
-// ─────────────────────────────
-
-async function criarPIX(user_id) {
-  const { data } = await axios.post(
-    "https://api.mercadopago.com/v1/payments",
-    {
-      transaction_amount: 10,
-      description: "Assinatura App",
-      payment_method_id: "pix",
-      payer: { email: "user@app.com" },
-      external_reference: String(user_id),
-    },
-    {
-      headers: {
-        Authorization: "Bearer " + MP_ACCESS_TOKEN,
-      },
-    }
-  );
-
-  return {
-    payment_id: data.id,
-    qr_code: data.point_of_interaction?.transaction_data?.qr_code
-  };
-}
-
-// ─────────────────────────────
-// 💳 COMPRAR
-// ─────────────────────────────
-
-app.post("/comprar", async (req, res) => {
-  try {
-    const { user_id } = req.body;
-
-    const { payment_id, qr_code } = await criarPIX(user_id);
-
-    await supabase.from("pagamentos").insert({
-      user_id,
-      payment_id,
-      status: "pendente",
-      valor: 10
-    });
-
-    res.json({ pix_code: qr_code });
-
-  } catch {
-    res.json({ error: true });
-  }
-});
-
-// ─────────────────────────────
-// 🔔 WEBHOOK
-// ─────────────────────────────
-
-app.post("/webhook", async (req, res) => {
-  try {
-    const paymentId = req.body?.data?.id;
-    if (!paymentId) return res.sendStatus(200);
-
-    const { data } = await axios.get(
-      "https://api.mercadopago.com/v1/payments/" + paymentId,
-      { headers: { Authorization: "Bearer " + MP_ACCESS_TOKEN } }
-    );
-
-    if (data.status !== "approved") return res.sendStatus(200);
-
-    const user_id = data.external_reference;
-
-    await supabase.from("usuarios")
-      .update({
-        status: "ativo",
-        assinatura_expira: futureDate(30)
-      })
-      .eq("id", user_id);
-
-    res.sendStatus(200);
-
-  } catch {
-    res.sendStatus(500);
-  }
-});
-
-// ─────────────────────────────
-// 🤖 ADMIN TELEGRAM
-// ─────────────────────────────
-
-// /admin
-bot.onText(/\/admin/, (msg) => {
-  const chatId = msg.chat.id;
-
-  if (!isAdmin(chatId)) {
-    return bot.sendMessage(chatId, "Acesso negado");
-  }
-
-  bot.sendMessage(chatId,
-    "Painel Admin:\n\n" +
-    "/bloquear user_id\n" +
-    "/liberar user_id\n" +
-    "/usuarios"
-  );
-});
-
-// bloquear
-bot.onText(/\/bloquear (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  if (!isAdmin(chatId)) return;
-
-  const userId = match[1];
-
-  await supabase.from("usuarios")
-    .update({ bloqueado: true })
-    .eq("id", userId);
-
-  bot.sendMessage(chatId, "🚫 Bloqueado: " + userId);
-});
-
-// liberar
-bot.onText(/\/liberar (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  if (!isAdmin(chatId)) return;
-
-  const userId = match[1];
-
-  await supabase.from("usuarios")
-    .update({
-      bloqueado: false,
-      status: "ativo",
-      assinatura_expira: futureDate(30)
-    })
-    .eq("id", userId);
-
-  bot.sendMessage(chatId, "✅ Liberado: " + userId);
-});
-
-// listar
-bot.onText(/\/usuarios/, async (msg) => {
-  const chatId = msg.chat.id;
-  if (!isAdmin(chatId)) return;
-
-  const { data } = await supabase
-    .from("usuarios")
-    .select("id, email, status, bloqueado")
-    .limit(20);
-
-  if (!data) return bot.sendMessage(chatId, "Sem usuários");
-
-  const lista = data.map(u =>
-    `${u.id}\n${u.email}\n${u.status} ${u.bloqueado ? "🚫" : "✅"}`
-  ).join("\n\n");
-
-  bot.sendMessage(chatId, lista);
-});
-
-// ─────────────────────────────
-// SERVER
-// ─────────────────────────────
-
-app.get("/", (_, res) => res.send("SaaS rodando 🚀"));
-
-app.listen(PORT, () => {
-  console.log("Servidor rodando na porta " + PORT);
-});
+// -------------------- Servidor --------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
