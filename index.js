@@ -8,7 +8,7 @@ const app = express();
 app.use(express.json());
 
 if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY || !process.env.JWT_SECRET) {
-  console.error('Variáveis de ambiente faltando: SUPABASE_URL, SUPABASE_KEY ou JWT_SECRET');
+  console.error('ERRO: faltam SUPABASE_URL, SUPABASE_KEY ou JWT_SECRET');
   process.exit(1);
 }
 
@@ -31,13 +31,16 @@ function autenticar(req, res, next) {
     const payload = jwt.verify(token, JWT_SECRET);
     req.user_id = payload.user_id;
     next();
-  } catch {
+  } catch (err) {
+    console.error('ERRO JWT:', err.message);
     return res.status(401).json({ ok: false, msg: 'Token inválido ou expirado' });
   }
 }
 
 app.post('/register', async (req, res) => {
   try {
+    console.log('BODY /register:', req.body);
+
     const { email, senha, device_id } = req.body || {};
 
     if (!email || !senha || !device_id) {
@@ -51,6 +54,7 @@ app.post('/register', async (req, res) => {
       .maybeSingle();
 
     if (existingError) {
+      console.error('SUPABASE /register select:', existingError);
       return res.status(500).json({ ok: false, msg: existingError.message });
     }
 
@@ -60,7 +64,7 @@ app.post('/register', async (req, res) => {
 
     const senhaHash = await bcrypt.hash(senha, 10);
 
-    const { error } = await supabase
+    const { error: insertError } = await supabase
       .from('usuarios')
       .insert([{
         email,
@@ -70,8 +74,9 @@ app.post('/register', async (req, res) => {
         assinatura_ativa: false
       }]);
 
-    if (error) {
-      return res.status(500).json({ ok: false, msg: error.message });
+    if (insertError) {
+      console.error('SUPABASE /register insert:', insertError);
+      return res.status(500).json({ ok: false, msg: insertError.message });
     }
 
     return res.status(201).json({ ok: true });
@@ -83,20 +88,23 @@ app.post('/register', async (req, res) => {
 
 app.post('/login', async (req, res) => {
   try {
+    console.log('BODY /login:', req.body);
+
     const { email, senha, device_id } = req.body || {};
 
     if (!email || !senha || !device_id) {
       return res.status(400).json({ ok: false, msg: 'Campos obrigatórios faltando' });
     }
 
-    const { data: user, error } = await supabase
+    const { data: user, error: userError } = await supabase
       .from('usuarios')
       .select('*')
       .eq('email', email)
       .maybeSingle();
 
-    if (error) {
-      return res.status(500).json({ ok: false, msg: error.message });
+    if (userError) {
+      console.error('SUPABASE /login select:', userError);
+      return res.status(500).json({ ok: false, msg: userError.message });
     }
 
     if (!user) {
@@ -114,17 +122,24 @@ app.post('/login', async (req, res) => {
       .eq('id', user.id);
 
     if (updateError) {
+      console.error('SUPABASE /login update device:', updateError);
       return res.status(500).json({ ok: false, msg: updateError.message });
     }
 
     const token = jwt.sign({ user_id: user.id }, JWT_SECRET, { expiresIn: '7d' });
 
-    await supabase.from('logs_uso').insert([{
-      user_id: user.id,
-      device_id,
-      acao: 'login',
-      data_hora: new Date().toISOString()
-    }]);
+    const { error: logError } = await supabase
+      .from('logs_uso')
+      .insert([{
+        user_id: user.id,
+        device_id,
+        acao: 'login',
+        data_hora: new Date().toISOString()
+      }]);
+
+    if (logError) {
+      console.error('SUPABASE /login log:', logError);
+    }
 
     return res.json({ ok: true, token });
   } catch (err) {
@@ -135,20 +150,23 @@ app.post('/login', async (req, res) => {
 
 app.post('/assinatura', autenticar, async (req, res) => {
   try {
+    console.log('BODY /assinatura:', req.body, 'USER_ID:', req.user_id);
+
     const { device_id } = req.body || {};
 
     if (!device_id) {
       return res.status(400).json({ ativo: false, msg: 'device_id obrigatório' });
     }
 
-    const { data: user, error } = await supabase
+    const { data: user, error: userError } = await supabase
       .from('usuarios')
       .select('*')
       .eq('id', req.user_id)
       .maybeSingle();
 
-    if (error) {
-      return res.status(500).json({ ativo: false, msg: error.message });
+    if (userError) {
+      console.error('SUPABASE /assinatura select:', userError);
+      return res.status(500).json({ ativo: false, msg: userError.message });
     }
 
     if (!user) {
@@ -164,12 +182,18 @@ app.post('/assinatura', autenticar, async (req, res) => {
     const diasDecorridos = Math.floor((hoje - inicioTeste) / (1000 * 60 * 60 * 24));
     const ativo = diasDecorridos < 7 || user.assinatura_ativa;
 
-    await supabase.from('logs_uso').insert([{
-      user_id: user.id,
-      device_id,
-      acao: 'verificacao_assinatura',
-      data_hora: hoje.toISOString()
-    }]);
+    const { error: logError } = await supabase
+      .from('logs_uso')
+      .insert([{
+        user_id: user.id,
+        device_id,
+        acao: 'verificacao_assinatura',
+        data_hora: hoje.toISOString()
+      }]);
+
+    if (logError) {
+      console.error('SUPABASE /assinatura log:', logError);
+    }
 
     return res.json({ ativo });
   } catch (err) {
