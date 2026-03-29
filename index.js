@@ -37,6 +37,23 @@ function autenticar(req, res, next) {
   }
 }
 
+function autenticarQuery(req, res, next) {
+  const token = req.query.token;
+
+  if (!token) {
+    return res.status(401).send('Token não fornecido');
+  }
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user_id = payload.user_id;
+    next();
+  } catch (err) {
+    console.error('ERRO JWT QUERY:', err.message);
+    return res.status(401).send('Token inválido ou expirado');
+  }
+}
+
 app.post('/register', async (req, res) => {
   try {
     console.log('BODY /register:', req.body);
@@ -199,6 +216,266 @@ app.post('/assinatura', autenticar, async (req, res) => {
   } catch (err) {
     console.error('ERRO /assinatura:', err);
     return res.status(500).json({ ativo: false, msg: err.message });
+  }
+});
+
+app.get('/checkout', autenticarQuery, async (req, res) => {
+  try {
+    const { device_id } = req.query;
+
+    if (!device_id) {
+      return res.status(400).send('device_id obrigatório');
+    }
+
+    const { data: user, error } = await supabase
+      .from('usuarios')
+      .select('*')
+      .eq('id', req.user_id)
+      .maybeSingle();
+
+    if (error) {
+      console.error('SUPABASE /checkout select:', error);
+      return res.status(500).send('Erro ao validar usuário');
+    }
+
+    if (!user) {
+      return res.status(404).send('Usuário não encontrado');
+    }
+
+    if (user.device_id !== device_id) {
+      return res.status(403).send('Dispositivo não autorizado');
+    }
+
+    return res.send(`
+      <!DOCTYPE html>
+      <html lang="pt-BR">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Assinatura</title>
+        <style>
+          * { box-sizing: border-box; }
+          body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            background: linear-gradient(180deg, #0b1220 0%, #111827 100%);
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+          }
+          .card {
+            width: 100%;
+            max-width: 460px;
+            background: rgba(17, 24, 39, 0.96);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 24px;
+            padding: 28px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+          }
+          .badge {
+            display: inline-block;
+            background: rgba(34,197,94,0.16);
+            color: #86efac;
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-size: 13px;
+            margin-bottom: 16px;
+          }
+          h1 {
+            margin: 0 0 12px;
+            font-size: 30px;
+            line-height: 1.15;
+          }
+          p {
+            margin: 0 0 18px;
+            color: #cbd5e1;
+            line-height: 1.5;
+          }
+          ul {
+            padding-left: 20px;
+            margin: 0 0 24px;
+            color: #e5e7eb;
+          }
+          li { margin-bottom: 10px; }
+          .price {
+            font-size: 32px;
+            font-weight: bold;
+            color: #4ade80;
+            margin-bottom: 8px;
+          }
+          .hint {
+            color: #94a3b8;
+            font-size: 14px;
+            margin-bottom: 24px;
+          }
+          .btn {
+            display: block;
+            width: 100%;
+            text-align: center;
+            text-decoration: none;
+            border: none;
+            cursor: pointer;
+            border-radius: 16px;
+            padding: 16px 18px;
+            font-size: 17px;
+            font-weight: bold;
+            transition: transform .15s ease, opacity .15s ease;
+          }
+          .btn:hover {
+            transform: translateY(-1px);
+          }
+          .btn-primary {
+            background: #16a34a;
+            color: white;
+          }
+          .btn-secondary {
+            background: rgba(255,255,255,0.06);
+            color: #e5e7eb;
+            margin-top: 12px;
+          }
+          .meta {
+            margin-top: 18px;
+            font-size: 12px;
+            color: #64748b;
+            word-break: break-all;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <div class="badge">Assinatura do app</div>
+          <h1>Seu acesso premium está bloqueado</h1>
+          <p>Continue usando o app e evite corridas ruins automaticamente.</p>
+
+          <ul>
+            <li>Evite corridas que dão prejuízo</li>
+            <li>Veja o valor real antes de aceitar</li>
+            <li>Aumente seu lucro por km</li>
+            <li>Funciona automaticamente enquanto dirige</li>
+          </ul>
+
+          <div class="price">R$10/mês</div>
+          <div class="hint">Menos que 1 corrida ruim por mês</div>
+
+          <a class="btn btn-primary" href="/criar-pagamento?device_id=${encodeURIComponent(device_id)}&token=${encodeURIComponent(req.query.token)}">
+            Assinar agora
+          </a>
+
+          <a class="btn btn-secondary" href="/">
+            Voltar
+          </a>
+
+          <div class="meta">device_id: ${device_id}</div>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error('ERRO /checkout:', err);
+    return res.status(500).send('Erro interno no checkout');
+  }
+});
+
+app.get('/criar-pagamento', autenticarQuery, async (req, res) => {
+  try {
+    const { device_id } = req.query;
+
+    if (!device_id) {
+      return res.status(400).send('device_id obrigatório');
+    }
+
+    const { data: user, error } = await supabase
+      .from('usuarios')
+      .select('*')
+      .eq('id', req.user_id)
+      .maybeSingle();
+
+    if (error) {
+      console.error('SUPABASE /criar-pagamento select:', error);
+      return res.status(500).send('Erro ao validar usuário');
+    }
+
+    if (!user) {
+      return res.status(404).send('Usuário não encontrado');
+    }
+
+    if (user.device_id !== device_id) {
+      return res.status(403).send('Dispositivo não autorizado');
+    }
+
+    // Placeholder até integrar Mercado Pago/PIX real.
+    return res.send(`
+      <!DOCTYPE html>
+      <html lang="pt-BR">
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Pagamento</title>
+        <style>
+          body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            background: #0f172a;
+            color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+          }
+          .card {
+            width: 100%;
+            max-width: 520px;
+            background: #111827;
+            border-radius: 24px;
+            padding: 28px;
+            box-shadow: 0 20px 60px rgba(0,0,0,.35);
+          }
+          h1 { margin-top: 0; }
+          p { color: #cbd5e1; line-height: 1.5; }
+          .box {
+            background: rgba(255,255,255,0.06);
+            border-radius: 16px;
+            padding: 16px;
+            margin-top: 18px;
+          }
+          .ok {
+            color: #4ade80;
+            font-weight: bold;
+          }
+          a {
+            display: inline-block;
+            margin-top: 18px;
+            color: #86efac;
+            text-decoration: none;
+            font-weight: bold;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>Pagamento em preparação</h1>
+          <p class="ok">A rota está pronta e validando o usuário corretamente.</p>
+          <p>Agora falta apenas integrar aqui o link real do Mercado Pago ou gerar o PIX automaticamente.</p>
+
+          <div class="box">
+            <div>Usuário: ${user.email}</div>
+            <div>device_id: ${device_id}</div>
+          </div>
+
+          <a href="/checkout?device_id=${encodeURIComponent(device_id)}&token=${encodeURIComponent(req.query.token)}">
+            Voltar para assinatura
+          </a>
+        </div>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error('ERRO /criar-pagamento:', err);
+    return res.status(500).send('Erro interno ao criar pagamento');
   }
 });
 
