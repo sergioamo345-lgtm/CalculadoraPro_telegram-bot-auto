@@ -9,11 +9,11 @@ app.use(express.json());
 
 // ===== CONFIG =====
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const JWT_SECRET = process.env.JWT_SECRET;
 const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // =============================
 // 🔐 LOGIN AUTOMÁTICO POR DEVICE (CORRIGIDO)
