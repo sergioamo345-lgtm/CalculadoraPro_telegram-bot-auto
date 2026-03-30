@@ -1,151 +1,166 @@
 require('dotenv').config();
 const express = require('express');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
+const bodyParser = require('body-parser');
 const { createClient } = require('@supabase/supabase-js');
+const jwt = require('jsonwebtoken');
+const { MercadoPagoConfig, Payment } = require('mercadopago');
 
 const app = express();
-app.use(express.json());
+app.use(bodyParser.json());
 
 // ===== CONFIG =====
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const JWT_SECRET = process.env.JWT_SECRET;
+const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
 
-// ===== TESTE =====
-app.get('/', (req, res) => {
-  res.send('API ONLINE 🚀');
-});
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const mpClient = new MercadoPagoConfig({ accessToken: MP_TOKEN });
 
-// ===== REGISTER =====
-app.post('/register', async (req, res) => {
+// =============================
+// 🔐 LOGIN AUTOMÁTICO POR DEVICE
+// =============================
+app.post('/auth-device', async (req, res) => {
   try {
-    const { email, senha, device_id } = req.body;
+    const { device_id } = req.body;
 
-    if (!email || !senha || !device_id) {
-      return res.status(400).json({ ok: false, msg: 'Dados inválidos' });
+    if (!device_id) {
+      return res.status(400).json({ error: 'device_id obrigatório' });
     }
 
-    const { data: existing } = await supabase
+    let { data: user } = await supabase
       .from('usuarios')
       .select('*')
-      .eq('email', email)
+      .eq('device_id', device_id)
       .maybeSingle();
 
-    if (existing) {
-      return res.status(409).json({ ok: false, msg: 'Já existe' });
-    }
-
-    const hash = await bcrypt.hash(senha, 10);
-
-    await supabase.from('usuarios').insert([{
-      email,
-      senha_hash: hash,
-      device_id,
-      data_inicio_teste: new Date().toISOString(),
-      assinatura_ativa: false
-    }]);
-
-    return res.json({ ok: true });
-
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ ok: false, msg: err.message });
-  }
-});
-
-// ===== LOGIN (CORRIGIDO) =====
-app.post('/login', async (req, res) => {
-  try {
-    const { email, senha, device_id } = req.body;
-
-    if (!email || !senha || !device_id) {
-      return res.status(400).json({ ok: false, msg: 'Dados inválidos' });
-    }
-
-    const { data: user } = await supabase
-      .from('usuarios')
-      .select('*')
-      .eq('email', email)
-      .maybeSingle();
-
+    // 🔥 se não existir → cria automaticamente
     if (!user) {
-      return res.status(401).json({ ok: false, msg: 'Usuário não encontrado' });
+      const { data: newUser } = await supabase
+        .from('usuarios')
+        .insert([{
+          device_id,
+          assinatura_ativa: false,
+          criado_em: new Date().toISOString()
+        }])
+        .select()
+        .single();
+
+      user = newUser;
     }
 
-    const valid = await bcrypt.compare(senha, user.senha_hash);
-
-    if (!valid) {
-      return res.status(401).json({ ok: false, msg: 'Senha inválida' });
-    }
-
-    // Atualiza device_id
-    await supabase
-      .from('usuarios')
-      .update({ device_id })
-      .eq('id', user.id);
-
-    // 🔥 IMPORTANTE: SEMPRE gerar token
     const token = jwt.sign(
       { user_id: user.id },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
 
-    return res.json({
-      ok: true,
-      token: token // 🔥 ESSENCIAL PRO APP
+    return res.json({ token });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// =============================
+// 💳 GERAR PIX
+// =============================
+app.post('/criar-pagamento', async (req, res) => {
+  try {
+    const { device_id } = req.body;
+
+    const payment = await new Payment(mpClient).create({
+      body: {
+        transaction_amount: 10,
+        description: "Assinatura Calculadora Moto PRO",
+        payment_method_id: "pix",
+        payer: {
+          email: "comprador@email.com"
+        }
+      }
+    });
+
+    await supabase.from('pagamentos').insert([{
+      device_id,
+      payment_id: payment.id,
+      status: 'pending'
+    }]);
+
+    res.json({
+      qr_code: payment.point_of_interaction.transaction_data.qr_code,
+      qr_code_base64: payment.point_of_interaction.transaction_data.qr_code_base64
     });
 
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ ok: false, msg: err.message });
+    res.status(500).json({ error: 'Erro ao gerar pagamento' });
   }
 });
 
-// ===== ASSINATURA =====
-app.post('/assinatura', async (req, res) => {
+// =============================
+// 🔔 WEBHOOK MERCADO PAGO
+// =============================
+app.post('/webhook', async (req, res) => {
   try {
-    const token = req.headers.authorization?.split(' ')[1];
+    const paymentId = req.body.data.id;
 
-    if (!token) {
-      return res.status(401).json({ ativo: false, msg: 'Sem token' });
+    const payment = await new Payment(mpClient).get({ id: paymentId });
+
+    if (payment.status === 'approved') {
+      const { data: pagamento } = await supabase
+        .from('pagamentos')
+        .select('*')
+        .eq('payment_id', paymentId)
+        .maybeSingle();
+
+      if (pagamento) {
+        await supabase
+          .from('usuarios')
+          .update({ assinatura_ativa: true })
+          .eq('device_id', pagamento.device_id);
+      }
     }
 
-    const decoded = jwt.verify(token, JWT_SECRET);
+    res.sendStatus(200);
 
-    const userId = decoded.user_id;
+  } catch (err) {
+    console.error(err);
+    res.sendStatus(500);
+  }
+});
+
+// =============================
+// 📡 STATUS DA ASSINATURA
+// =============================
+app.post('/assinatura', async (req, res) => {
+  try {
+    const { device_id } = req.body;
 
     const { data: user } = await supabase
       .from('usuarios')
       .select('*')
-      .eq('id', userId)
+      .eq('device_id', device_id)
       .maybeSingle();
 
     if (!user) {
-      return res.status(404).json({ ativo: false });
+      return res.json({ ativo: false });
     }
 
-    const hoje = new Date();
-    const inicioTeste = new Date(user.data_inicio_teste);
-    const dias = Math.floor((hoje - inicioTeste) / (1000 * 60 * 60 * 24));
-
-    const ativo = dias < 7 || user.assinatura_ativa;
-
     return res.json({
-      ativo: ativo,
-      em_teste: dias < 7,
-      dias_restantes_teste: Math.max(0, 7 - dias),
-      assinatura_ativa: user.assinatura_ativa
+      ativo: user.assinatura_ativa === true
     });
 
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ ativo: false });
+    res.status(500).json({ ativo: false });
   }
 });
 
-// ===== START =====
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('Servidor rodando 🚀');
+// =============================
+app.get('/', (req, res) => {
+  res.send('API rodando 🚀');
 });
+
+// =============================
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log('Servidor rodando 🚀'));
