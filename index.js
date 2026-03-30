@@ -1,12 +1,11 @@
 require('dotenv').config();
 const express = require('express');
-const bodyParser = require('body-parser');
+const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 const jwt = require('jsonwebtoken');
-const { MercadoPagoConfig, Payment } = require('mercadopago');
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json());
 
 // ===== CONFIG =====
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -15,7 +14,6 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
-const mpClient = new MercadoPagoConfig({ accessToken: MP_TOKEN });
 
 // =============================
 // 🔐 LOGIN AUTOMÁTICO POR DEVICE
@@ -34,7 +32,6 @@ app.post('/auth-device', async (req, res) => {
       .eq('device_id', device_id)
       .maybeSingle();
 
-    // 🔥 se não existir → cria automaticamente
     if (!user) {
       const { data: newUser } = await supabase
         .from('usuarios')
@@ -64,22 +61,34 @@ app.post('/auth-device', async (req, res) => {
 });
 
 // =============================
-// 💳 GERAR PIX
+// 💳 GERAR PIX (SEM SDK)
 // =============================
 app.post('/criar-pagamento', async (req, res) => {
   try {
     const { device_id } = req.body;
 
-    const payment = await new Payment(mpClient).create({
-      body: {
+    const externalReference = `assinatura_${device_id}_${Date.now()}`;
+
+    const response = await axios.post(
+      'https://api.mercadopago.com/v1/payments',
+      {
         transaction_amount: 10,
-        description: "Assinatura Calculadora Moto PRO",
-        payment_method_id: "pix",
+        description: 'Assinatura Calculadora Moto PRO',
+        payment_method_id: 'pix',
+        external_reference: externalReference,
         payer: {
-          email: "comprador@email.com"
+          email: 'cliente@email.com'
+        }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${MP_TOKEN}`,
+          'Content-Type': 'application/json'
         }
       }
-    });
+    );
+
+    const payment = response.data;
 
     await supabase.from('pagamentos').insert([{
       device_id,
@@ -93,7 +102,7 @@ app.post('/criar-pagamento', async (req, res) => {
     });
 
   } catch (err) {
-    console.error(err);
+    console.error(err.response?.data || err.message);
     res.status(500).json({ error: 'Erro ao gerar pagamento' });
   }
 });
@@ -101,11 +110,22 @@ app.post('/criar-pagamento', async (req, res) => {
 // =============================
 // 🔔 WEBHOOK MERCADO PAGO
 // =============================
-app.post('/webhook', async (req, res) => {
+app.post('/webhook/mercadopago', async (req, res) => {
   try {
-    const paymentId = req.body.data.id;
+    const paymentId = req.query['data.id'] || req.body?.data?.id;
 
-    const payment = await new Payment(mpClient).get({ id: paymentId });
+    if (!paymentId) return res.sendStatus(200);
+
+    const response = await axios.get(
+      `https://api.mercadopago.com/v1/payments/${paymentId}`,
+      {
+        headers: {
+          Authorization: `Bearer ${MP_TOKEN}`
+        }
+      }
+    );
+
+    const payment = response.data;
 
     if (payment.status === 'approved') {
       const { data: pagamento } = await supabase
@@ -125,7 +145,7 @@ app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
 
   } catch (err) {
-    console.error(err);
+    console.error(err.response?.data || err.message);
     res.sendStatus(500);
   }
 });
@@ -143,12 +163,8 @@ app.post('/assinatura', async (req, res) => {
       .eq('device_id', device_id)
       .maybeSingle();
 
-    if (!user) {
-      return res.json({ ativo: false });
-    }
-
     return res.json({
-      ativo: user.assinatura_ativa === true
+      ativo: user?.assinatura_ativa === true
     });
 
   } catch (err) {
