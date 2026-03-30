@@ -9,16 +9,6 @@ const { createClient } = require('@supabase/supabase-js');
 const app = express();
 app.use(express.json());
 
-if (
-  !process.env.SUPABASE_URL ||
-  !process.env.SUPABASE_KEY ||
-  !process.env.JWT_SECRET ||
-  !process.env.MP_ACCESS_TOKEN
-) {
-  console.error('ERRO: faltam variáveis de ambiente');
-  process.exit(1);
-}
-
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const JWT_SECRET = process.env.JWT_SECRET;
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
@@ -55,20 +45,20 @@ function autenticarQuery(req, res, next) {
 }
 
 async function buscarUsuarioPorId(id) {
-  const { data } = await supabase.from('usuarios').select('*').eq('id', id).maybeSingle();
+  const { data } = await supabase
+    .from('usuarios')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
   return data;
 }
 
 //
-// 🚀 ROTA NOVA (ESSENCIAL)
+// 🔥 AUTH AUTOMÁTICO (NOVO)
 //
 app.post('/auth-device', async (req, res) => {
   try {
     const { device_id } = req.body;
-
-    if (!device_id) {
-      return res.status(400).json({ ok: false, msg: 'device_id obrigatório' });
-    }
 
     const email = `device_${device_id}@app.com`;
     const senha = device_id;
@@ -80,13 +70,13 @@ app.post('/auth-device', async (req, res) => {
       .maybeSingle();
 
     if (!user) {
-      const senhaHash = await bcrypt.hash(senha, 10);
+      const hash = await bcrypt.hash(senha, 10);
 
-      const { data: newUser, error } = await supabase
+      const { data: newUser } = await supabase
         .from('usuarios')
         .insert([{
           email,
-          senha_hash: senhaHash,
+          senha_hash: hash,
           device_id,
           data_inicio_teste: new Date().toISOString(),
           assinatura_ativa: false
@@ -94,57 +84,89 @@ app.post('/auth-device', async (req, res) => {
         .select()
         .single();
 
-      if (error) {
-        return res.status(500).json({ ok: false, msg: error.message });
-      }
-
       user = newUser;
     }
 
     const token = jwt.sign({ user_id: user.id }, JWT_SECRET, { expiresIn: '7d' });
 
-    return res.json({ ok: true, token });
+    res.json({ ok: true, token });
 
   } catch (err) {
-    console.error('ERRO /auth-device:', err);
-    return res.status(500).json({ ok: false, msg: err.message });
+    res.status(500).json({ ok: false });
   }
 });
 
 //
-// LOGIN
+// 🔁 COMPATIBILIDADE COM APP (SEU CASO)
 //
+app.post('/register', async (req, res) => {
+  try {
+    const { email, senha, device_id } = req.body;
+
+    const { data: existing } = await supabase
+      .from('usuarios')
+      .select('*')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (existing) {
+      return res.status(409).json({ ok: false });
+    }
+
+    const hash = await bcrypt.hash(senha, 10);
+
+    await supabase.from('usuarios').insert([{
+      email,
+      senha_hash: hash,
+      device_id,
+      data_inicio_teste: new Date().toISOString(),
+      assinatura_ativa: false
+    }]);
+
+    res.json({ ok: true });
+
+  } catch {
+    res.status(500).json({ ok: false });
+  }
+});
+
 app.post('/login', async (req, res) => {
-  const { email, senha, device_id } = req.body;
+  try {
+    const { email, senha, device_id } = req.body;
 
-  const { data: user } = await supabase
-    .from('usuarios')
-    .select('*')
-    .eq('email', email)
-    .maybeSingle();
+    const { data: user } = await supabase
+      .from('usuarios')
+      .select('*')
+      .eq('email', email)
+      .maybeSingle();
 
-  if (!user) return res.status(401).json({ ok: false });
+    if (!user) return res.status(401).json({ ok: false });
 
-  const ok = await bcrypt.compare(senha, user.senha_hash);
-  if (!ok) return res.status(401).json({ ok: false });
+    const valid = await bcrypt.compare(senha, user.senha_hash);
+    if (!valid) return res.status(401).json({ ok: false });
 
-  await supabase.from('usuarios').update({ device_id }).eq('id', user.id);
+    await supabase.from('usuarios')
+      .update({ device_id })
+      .eq('id', user.id);
 
-  const token = jwt.sign({ user_id: user.id }, JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ user_id: user.id }, JWT_SECRET, { expiresIn: '7d' });
 
-  return res.json({ ok: true, token });
+    res.json({ ok: true, token });
+
+  } catch {
+    res.status(500).json({ ok: false });
+  }
 });
 
 //
-// ASSINATURA
+// 💰 ASSINATURA
 //
 app.post('/assinatura', autenticar, async (req, res) => {
   const { device_id } = req.body;
 
   const user = await buscarUsuarioPorId(req.user_id);
-  if (!user) return res.json({ ativo: false });
 
-  if (user.device_id !== device_id) {
+  if (!user || user.device_id !== device_id) {
     return res.json({ ativo: false });
   }
 
@@ -152,13 +174,13 @@ app.post('/assinatura', autenticar, async (req, res) => {
 
   const ativo = dias < 7 || user.assinatura_ativa;
 
-  return res.json({ ativo });
+  res.json({ ativo });
 });
 
 //
-// CHECKOUT
+// 💳 CHECKOUT
 //
-app.get('/checkout', autenticarQuery, async (req, res) => {
+app.get('/checkout', autenticarQuery, (req, res) => {
   const { device_id, token } = req.query;
 
   res.send(`
@@ -170,7 +192,7 @@ app.get('/checkout', autenticarQuery, async (req, res) => {
 });
 
 //
-// PIX
+// 💸 PIX
 //
 app.get('/criar-pagamento', autenticarQuery, async (req, res) => {
   const user = await buscarUsuarioPorId(req.user_id);
@@ -195,7 +217,7 @@ app.get('/criar-pagamento', autenticarQuery, async (req, res) => {
 });
 
 //
-// WEBHOOK
+// 🔔 WEBHOOK
 //
 app.post('/webhook/mercadopago', async (req, res) => {
   const id = req.body?.data?.id;
