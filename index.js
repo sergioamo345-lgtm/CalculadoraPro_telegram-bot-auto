@@ -16,24 +16,29 @@ const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // =============================
-// 🔐 LOGIN AUTOMÁTICO POR DEVICE
+// 🔐 LOGIN AUTOMÁTICO POR DEVICE (CORRIGIDO)
 // =============================
 app.post('/auth-device', async (req, res) => {
   try {
     const { device_id } = req.body;
 
     if (!device_id) {
-      return res.status(400).json({ error: 'device_id obrigatório' });
+      return res.status(400).json({ ok: false, error: 'device_id obrigatório' });
     }
 
-    let { data: user } = await supabase
+    let { data: user, error } = await supabase
       .from('usuarios')
       .select('*')
       .eq('device_id', device_id)
       .maybeSingle();
 
+    if (error) {
+      console.error('Erro ao buscar usuário:', error);
+    }
+
+    // 🔥 SE NÃO EXISTE → CRIA
     if (!user) {
-      const { data: newUser } = await supabase
+      const { data, error: insertError } = await supabase
         .from('usuarios')
         .insert([{
           device_id,
@@ -43,7 +48,17 @@ app.post('/auth-device', async (req, res) => {
         .select()
         .single();
 
-      user = newUser;
+      if (insertError || !data) {
+        console.error('Erro ao criar usuário:', insertError);
+        return res.status(500).json({ ok: false, error: 'Erro ao criar usuário' });
+      }
+
+      user = data;
+    }
+
+    if (!user || !user.id) {
+      console.error('Usuário inválido:', user);
+      return res.status(500).json({ ok: false, error: 'Usuário inválido' });
     }
 
     const token = jwt.sign(
@@ -52,20 +67,24 @@ app.post('/auth-device', async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    return res.json({ token });
+    return res.json({ ok: true, token });
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Erro interno' });
+    console.error('ERRO AUTH:', err);
+    res.status(500).json({ ok: false, error: 'Erro interno' });
   }
 });
 
 // =============================
-// 💳 GERAR PIX (SEM SDK)
+// 💳 GERAR PIX
 // =============================
 app.post('/criar-pagamento', async (req, res) => {
   try {
     const { device_id } = req.body;
+
+    if (!device_id) {
+      return res.status(400).json({ error: 'device_id obrigatório' });
+    }
 
     const externalReference = `assinatura_${device_id}_${Date.now()}`;
 
@@ -102,19 +121,22 @@ app.post('/criar-pagamento', async (req, res) => {
     });
 
   } catch (err) {
-    console.error(err.response?.data || err.message);
+    console.error('Erro pagamento:', err.response?.data || err.message);
     res.status(500).json({ error: 'Erro ao gerar pagamento' });
   }
 });
 
 // =============================
-// 🔔 WEBHOOK MERCADO PAGO
+// 🔔 WEBHOOK MERCADO PAGO (CORRIGIDO)
 // =============================
 app.post('/webhook/mercadopago', async (req, res) => {
   try {
     const paymentId = req.query['data.id'] || req.body?.data?.id;
 
-    if (!paymentId) return res.sendStatus(200);
+    if (!paymentId) {
+      console.log('Webhook sem paymentId');
+      return res.sendStatus(200);
+    }
 
     const response = await axios.get(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
@@ -139,13 +161,20 @@ app.post('/webhook/mercadopago', async (req, res) => {
           .from('usuarios')
           .update({ assinatura_ativa: true })
           .eq('device_id', pagamento.device_id);
+
+        await supabase
+          .from('pagamentos')
+          .update({ status: 'approved' })
+          .eq('payment_id', paymentId);
+
+        console.log('Pagamento aprovado e liberado!');
       }
     }
 
     res.sendStatus(200);
 
   } catch (err) {
-    console.error(err.response?.data || err.message);
+    console.error('Erro webhook:', err.response?.data || err.message);
     res.sendStatus(500);
   }
 });
@@ -156,6 +185,10 @@ app.post('/webhook/mercadopago', async (req, res) => {
 app.post('/assinatura', async (req, res) => {
   try {
     const { device_id } = req.body;
+
+    if (!device_id) {
+      return res.json({ ativo: false });
+    }
 
     const { data: user } = await supabase
       .from('usuarios')
@@ -168,6 +201,7 @@ app.post('/assinatura', async (req, res) => {
     });
 
   } catch (err) {
+    console.error('Erro assinatura:', err);
     res.status(500).json({ ativo: false });
   }
 });
