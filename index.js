@@ -3,6 +3,7 @@ const express = require('express');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
@@ -36,6 +37,16 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
+function idempotencyKeyFor(deviceId) {
+  const windowMs = 5 * 60 * 1000; // 5 min (evita duplicar se clicar várias vezes)
+  const bucket = Math.floor(Date.now() / windowMs);
+  return crypto
+    .createHash('sha256')
+    .update(`pix:${deviceId}:${bucket}`)
+    .digest('hex')
+    .slice(0, 32);
+}
+
 async function createPixPaymentForDevice(device_id) {
   if (!device_id) {
     const err = new Error('device_id obrigatório');
@@ -52,14 +63,13 @@ async function createPixPaymentForDevice(device_id) {
       description: 'Assinatura Calculadora Moto PRO',
       payment_method_id: 'pix',
       external_reference: externalReference,
-      payer: {
-        email: 'cliente@email.com'
-      }
+      payer: { email: 'cliente@email.com' }
     },
     {
       headers: {
         Authorization: `Bearer ${MP_TOKEN}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'X-Idempotency-Key': idempotencyKeyFor(device_id)
       },
       timeout: 30000
     }
@@ -126,12 +136,7 @@ async function authDeviceHandler(req, res) {
       return res.status(500).json({ ok: false, error: 'Usuário inválido' });
     }
 
-    const token = jwt.sign(
-      { user_id: user.id },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
+    const token = jwt.sign({ user_id: user.id }, JWT_SECRET, { expiresIn: '7d' });
     return res.json({ ok: true, token });
   } catch (err) {
     console.error('ERRO AUTH:', err);
@@ -143,22 +148,16 @@ app.post('/auth-device', authDeviceHandler);
 app.post('/register', authDeviceHandler);
 
 // =============================
-// ✅ CHECKOUT (WEBVIEW) — rota que o app abre
+// ✅ CHECKOUT (WEBVIEW)
 // =============================
 app.get('/checkout', async (req, res) => {
   try {
     const device_id = String(req.query.device_id || '').trim();
 
-    // token é opcional aqui; o app envia, mas não precisamos pra gerar o Pix
-    // (se quiser endurecer depois, dá pra validar jwt.verify(token, JWT_SECRET))
-    // const token = String(req.query.token || '').trim();
-
     const pix = await createPixPaymentForDevice(device_id);
 
     const qrText = pix.qr_code || '';
-    const qrImg = pix.qr_code_base64
-      ? `data:image/png;base64,${pix.qr_code_base64}`
-      : '';
+    const qrImg = pix.qr_code_base64 ? `data:image/png;base64,${pix.qr_code_base64}` : '';
 
     res.status(200).set('Content-Type', 'text/html; charset=utf-8').send(`
 <!doctype html>
@@ -219,23 +218,18 @@ app.get('/checkout', async (req, res) => {
     `.trim());
   } catch (err) {
     console.error('Erro /checkout:', err.response?.data || err.message || err);
-    const message = err?.statusCode === 400 ? err.message : 'Erro ao carregar checkout.';
-    res.status(err?.statusCode || 500).send(message);
+    res.status(500).send('Erro ao carregar checkout.');
   }
 });
 
 // =============================
-// 💳 GERAR PIX (API) — continua existindo
+// 💳 GERAR PIX (API)
 // =============================
 app.post('/criar-pagamento', async (req, res) => {
   try {
     const { device_id } = req.body;
     const pix = await createPixPaymentForDevice(device_id);
-
-    return res.json({
-      qr_code: pix.qr_code,
-      qr_code_base64: pix.qr_code_base64
-    });
+    return res.json({ qr_code: pix.qr_code, qr_code_base64: pix.qr_code_base64 });
   } catch (err) {
     console.error('Erro pagamento:', err.response?.data || err.message);
     return res.status(500).json({ error: 'Erro ao gerar pagamento' });
@@ -256,10 +250,7 @@ app.post('/webhook/mercadopago', async (req, res) => {
 
     const response = await axios.get(
       `https://api.mercadopago.com/v1/payments/${paymentId}`,
-      {
-        headers: { Authorization: `Bearer ${MP_TOKEN}` },
-        timeout: 30000
-      }
+      { headers: { Authorization: `Bearer ${MP_TOKEN}` }, timeout: 30000 }
     );
 
     const payment = response.data;
@@ -300,9 +291,7 @@ app.post('/assinatura', async (req, res) => {
   try {
     const { device_id } = req.body;
 
-    if (!device_id) {
-      return res.json({ ativo: false });
-    }
+    if (!device_id) return res.json({ ativo: false });
 
     const { data: user } = await supabase
       .from('usuarios')
@@ -317,11 +306,7 @@ app.post('/assinatura', async (req, res) => {
   }
 });
 
-// =============================
-app.get('/', (req, res) => {
-  res.send('API rodando 🚀');
-});
+app.get('/', (req, res) => res.send('API rodando 🚀'));
 
-// =============================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log('Servidor rodando 🚀'));
