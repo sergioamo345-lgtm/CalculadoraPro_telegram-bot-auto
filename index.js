@@ -10,15 +10,28 @@ app.use(express.json());
 // ===== CONFIG =====
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const JWT_SECRET = process.env.JWT_SECRET;
-const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
+const JWT_SECRET = (process.env.JWT_SECRET || '').trim();
+const MP_TOKEN = (process.env.MP_ACCESS_TOKEN || '').trim();
+
+// valida env mínima (evita erro “assinatura”/secret undefined)
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('ERRO: SUPABASE_URL ou SUPABASE_KEY não configurados no ambiente.');
+  process.exit(1);
+}
+if (!JWT_SECRET) {
+  console.error('ERRO: JWT_SECRET não configurado no ambiente.');
+  process.exit(1);
+}
+if (!MP_TOKEN) {
+  console.warn('AVISO: MP_ACCESS_TOKEN não configurado. Rotas de pagamento podem falhar.');
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // =============================
-// 🔐 LOGIN AUTOMÁTICO POR DEVICE
+// 🔐 LOGIN / REGISTRO AUTOMÁTICO POR DEVICE
 // =============================
-app.post('/auth-device', async (req, res) => {
+async function authDeviceHandler(req, res) {
   try {
     const { device_id } = req.body;
 
@@ -36,7 +49,7 @@ app.post('/auth-device', async (req, res) => {
       console.error('Erro ao buscar usuário:', error);
     }
 
-    // 🔥 SE NÃO EXISTE → CRIA
+    // SE NÃO EXISTE → CRIA
     if (!user) {
       const { data, error: insertError } = await supabase
         .from('usuarios')
@@ -68,12 +81,17 @@ app.post('/auth-device', async (req, res) => {
     );
 
     return res.json({ ok: true, token });
-
   } catch (err) {
     console.error('ERRO AUTH:', err);
-    res.status(500).json({ ok: false, error: 'Erro interno' });
+    return res.status(500).json({ ok: false, error: 'Erro interno' });
   }
-});
+}
+
+// rota “nova” (seu backend já tinha)
+app.post('/auth-device', authDeviceHandler);
+
+// rota “antiga” que seu app está chamando (corrige o Cannot POST /register)
+app.post('/register', authDeviceHandler);
 
 // =============================
 // 💳 GERAR PIX
@@ -115,14 +133,13 @@ app.post('/criar-pagamento', async (req, res) => {
       status: 'pending'
     }]);
 
-    res.json({
+    return res.json({
       qr_code: payment.point_of_interaction.transaction_data.qr_code,
       qr_code_base64: payment.point_of_interaction.transaction_data.qr_code_base64
     });
-
   } catch (err) {
     console.error('Erro pagamento:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Erro ao gerar pagamento' });
+    return res.status(500).json({ error: 'Erro ao gerar pagamento' });
   }
 });
 
@@ -171,11 +188,10 @@ app.post('/webhook/mercadopago', async (req, res) => {
       }
     }
 
-    res.sendStatus(200);
-
+    return res.sendStatus(200);
   } catch (err) {
     console.error('Erro webhook:', err.response?.data || err.message);
-    res.sendStatus(500);
+    return res.sendStatus(500);
   }
 });
 
@@ -199,10 +215,9 @@ app.post('/assinatura', async (req, res) => {
     return res.json({
       ativo: user?.assinatura_ativa === true
     });
-
   } catch (err) {
     console.error('Erro assinatura:', err);
-    res.status(500).json({ ativo: false });
+    return res.status(500).json({ ativo: false });
   }
 });
 
